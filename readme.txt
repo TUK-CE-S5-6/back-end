@@ -11,3 +11,6 @@ pip freeze > requirements.txt
 
 가상환경 pip 설치
 pip install -r requirements.txt
+
+PostgreSQL DB 실행:
+pg_ctl -D "C:\Program Files\PostgreSQL\16\data" start
