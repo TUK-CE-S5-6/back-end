@@ -1,14 +1,20 @@
 import os
+import time
 import openai
 import psycopg2
+import numpy as np
+import librosa
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from whisper import load_model
-from moviepy.editor import AudioFileClip
+from moviepy.editor import AudioFileClip, VideoFileClip
 import logging
-from elevenlabs import ElevenLabs
+from elevenlabs import set_api_key, generate, Voice
+from spleeter.separator import Separator
+import shutil
+from fastapi.staticfiles import StaticFiles
 
 #########################
 # PostgreSQL 설정
@@ -39,6 +45,12 @@ app.add_middleware(
 )
 
 #########################
+# 정적 파일 제공 (비디오 및 오디오)
+#########################
+app.mount("/videos", StaticFiles(directory="uploaded_videos"), name="videos")
+app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
+
+#########################
 # Pydantic 모델
 #########################
 class UserCreate(BaseModel):
@@ -61,8 +73,17 @@ os.makedirs(AUDIO_FOLDER, exist_ok=True)
 WHISPER_MODEL = "large"
 model = load_model(WHISPER_MODEL)
 
-OPENAI_API_KEY = "token key"
+#########################
+# OpenAI API 설정
+#########################
+OPENAI_API_KEY = "gpt-key"
 openai.api_key = OPENAI_API_KEY
+
+#########################
+# ElevenLabs TTS 설정
+#########################
+ELEVENLABS_API_KEY = "eleven-key"
+set_api_key(ELEVENLABS_API_KEY)
 
 #########################
 # PostgreSQL 연결 함수
@@ -152,117 +173,272 @@ def read_user(user_id: int):
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
     return {"user_id": row[0], "username": row[1]}
 
-#########################
-# 동영상 업로드 라우트
-#########################
 @app.post("/upload-video")
 async def upload_video(file: UploadFile = File(...)):
-    """
-    클라이언트에서 동영상을 업로드하는 엔드포인트
-    """
     try:
         file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
 
-        return JSONResponse(content={"message": f"파일 {file.filename} 업로드 완료"}, status_code=200)
+        # ✅ 업로드된 파일 저장
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # ✅ 🎥 비디오 길이(duration) 계산
+        video_clip = VideoFileClip(file_path)
+        duration = video_clip.duration
+
+        # ✅ 🎼 비디오에서 오디오 추출
+        extracted_audio_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_audio.mp3")
+        audio_clip = video_clip.audio
+        audio_clip.write_audiofile(extracted_audio_path, codec='mp3')
+        audio_clip.close()
+        video_clip.close()
+
+        # ✅ 🎙️ 음성과 배경음악 분리 (Spleeter 실행)
+        try:
+            separator = Separator("spleeter:2stems")
+            separator.separate_to_file(extracted_audio_path, AUDIO_FOLDER)  # ✅ 기존 output_dir 없이 직접 저장
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Spleeter 실행 실패: {str(e)}")
+
+        # ✅ Spleeter가 만든 하위 폴더 자동 탐색
+        sub_dirs = [d for d in os.listdir(AUDIO_FOLDER) if os.path.isdir(os.path.join(AUDIO_FOLDER, d))]
+        if not sub_dirs:
+            raise FileNotFoundError(f"Spleeter 실행 후 '{AUDIO_FOLDER}'에 파일이 생성되지 않았습니다.")
+
+        spleeter_folder = os.path.join(AUDIO_FOLDER, sub_dirs[0])  # ✅ 자동 생성된 폴더 찾기
+        vocals_path = os.path.join(spleeter_folder, "vocals.wav")
+        bgm_path = os.path.join(spleeter_folder, "accompaniment.wav")
+
+        # ✅ 경로 정리 (불필요한 폴더 제거)
+        fixed_vocals_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_vocals.wav")
+        fixed_bgm_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_bgm.wav")
+
+        shutil.move(vocals_path, fixed_vocals_path)
+        shutil.move(bgm_path, fixed_bgm_path)
+
+        # ✅ Spleeter가 만든 폴더 삭제
+        shutil.rmtree(spleeter_folder)  # 🔥 불필요한 폴더 제거
+
+        # ✅ 📌 DB에 비디오 정보 저장
+        conn = get_connection()
+        curs = conn.cursor()
+
+        curs.execute("""
+            INSERT INTO videos (file_name, file_path, duration) 
+            VALUES (%s, %s, %s) RETURNING video_id;
+        """, (file.filename, file_path, duration))
+        
+        video_id = curs.fetchone()[0]
+
+        # ✅ 📌 DB에 배경음(BGM) 저장
+        curs.execute("""
+            INSERT INTO background_music (video_id, file_path, volume) 
+            VALUES (%s, %s, %s);
+        """, (video_id, fixed_bgm_path, 1.0))  # 기본 볼륨 1.0
+
+        conn.commit()
+        curs.close()
+        conn.close()
+
+        # ✅ 📌 STT, 번역, TTS 순차 실행
+        await transcribe_audio(fixed_vocals_path, video_id)
+        await translate_video(video_id)
+        await generate_tts(video_id)
+        return await get_edit_data(video_id)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"업로드 실패: {str(e)}")
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 #########################
-# STT + 번역 기능
+# 📌 2. STT 변환 & 저장
 #########################
-@app.post("/stt-video")
-async def upload_and_transcribe(file: UploadFile = File(...)):
-    """
-    동영상을 업로드받아 Whisper로 STT 수행 후 ChatGPT로 번역
-    """
+async def transcribe_audio(audio_path: str, video_id: int):
     try:
-        logging.info("STT 및 번역 작업 시작")
+        conn = get_connection()
+        curs = conn.cursor()
 
-        video_path = os.path.join(UPLOAD_FOLDER, file.filename)
-        with open(video_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+        # Whisper로 STT 실행
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"STT 변환 실패: {audio_path} 파일이 존재하지 않습니다.")
 
-        audio_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}.wav")
-        audio_clip = AudioFileClip(video_path)
-        audio_clip.write_audiofile(audio_path)
-        audio_clip.close()
-
-        logging.info("Whisper 대본 생성 시작")
         result = model.transcribe(audio_path, word_timestamps=True)
 
-        transcription_file = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_transcription.txt")
-        with open(transcription_file, "w", encoding="utf-8") as f:
-            for segment in result["segments"]:
-                f.write(f"[{segment['start']:.2f}s - {segment['end']:.2f}s] {segment['text']}\n")
+        for segment in result["segments"]:
+            start_time = float(segment["start"])
+            end_time = float(segment["end"])
 
-        return JSONResponse(content={"transcription": open(transcription_file, "r", encoding="utf-8").read()}, status_code=200)
+            curs.execute("""
+                INSERT INTO transcripts (video_id, language, text, start_time, end_time)
+                VALUES (%s, %s, %s, %s, %s);
+            """, (video_id, "ko", segment["text"], start_time, end_time))
+
+        conn.commit()
+        curs.close()
+        conn.close()
 
     except Exception as e:
-        logging.error(f"STT 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"STT 실패: {str(e)}")
-
-@app.post("/generate-tts")
-async def generate_tts(request: TTSRequest):
-    """
-    저장된 번역 메모장을 읽어서 영어 음성 생성
-    """
+    
+#########################
+# 📌 4. 번역 & 저장 (자동 실행)
+#########################
+async def translate_video(video_id: int):
     try:
-        logging.info("TTS 생성 시작")
+        conn = get_connection()
+        curs = conn.cursor()
 
-        file_name = request.file_name  # 파일 이름 가져오기
-        english_transcription_file = os.path.join(AUDIO_FOLDER, f"{file_name}_translation.txt")
-        tts_output_dir = os.path.join(AUDIO_FOLDER, f"{file_name}_tts")
+        # STT 데이터 가져오기
+        curs.execute("SELECT transcript_id, text FROM transcripts WHERE video_id = %s;", (video_id,))
+        transcripts = curs.fetchall()
+
+        if not transcripts:
+            raise HTTPException(status_code=404, detail="STT 데이터가 없습니다.")
+
+        for transcript_id, text in transcripts:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[{"role": "system", "content": "Translate the following Korean text into English."},
+                          {"role": "user", "content": text}]
+            )
+            translated_text = response["choices"][0]["message"]["content"].strip()
+
+            curs.execute("""
+                INSERT INTO translations (transcript_id, language, text)
+                VALUES (%s, %s, %s);
+            """, (transcript_id, "en", translated_text))
+
+        conn.commit()
+        curs.close()
+        conn.close()
+
+        logging.info(f"번역 완료: video_id={video_id}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"번역 실패: {str(e)}")
+
+#########################
+# 📌 5. TTS 변환 & 저장 (자동 실행)
+#########################
+async def generate_tts(video_id: int):
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+
+        # 번역된 데이터 가져오기 (번역 ID, 텍스트, 시작 시간)
+        curs.execute("""
+            SELECT t.translation_id, t.text, tr.start_time
+            FROM translations t
+            JOIN transcripts tr ON t.transcript_id = tr.transcript_id
+            WHERE tr.video_id = %s;
+        """, (video_id,))
+        translations = curs.fetchall()
+
+        if not translations:
+            raise HTTPException(status_code=404, detail="번역된 데이터가 없습니다.")
+
+        tts_output_dir = os.path.join(AUDIO_FOLDER, f"{video_id}_tts")
         os.makedirs(tts_output_dir, exist_ok=True)
 
-        if not os.path.exists(english_transcription_file):
-            raise FileNotFoundError(f"번역 파일을 찾을 수 없습니다: {english_transcription_file}")
+        # ✅ 사용하고 싶은 voice_id 지정
+        selected_voice_id = "5Af3x6nAIWjF6agOOtOz"  # 원하는 voice_id 설정
 
-        # 번역 파일 읽기
-        with open(english_transcription_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        for translation_id, text, start_time in translations:
+            try:
+                # ✅ Voice 객체를 사용하여 voice_id 지정
+                voice = Voice(voice_id=selected_voice_id)
 
-        # ElevenLabs 클라이언트 초기화
-        elevenlabs_client = ElevenLabs(api_key="token key")  # API 키 설정
+                # ✅ 올바른 generate() 호출 방식 적용
+                audio = generate(
+                    text=text,
+                    voice=voice,  # voice_id를 Voice 객체로 전달
+                    model="eleven_multilingual_v2"
+                )
 
-        for i, line in enumerate(lines):
-            # 타임스탬프가 있고 "-"가 포함된 줄만 처리
-            if line.startswith("[") and "-" in line and "]" in line:
-                try:
-                    # 타임스탬프 뒤의 텍스트 추출
-                    content = line.split("]", 1)[1].strip()
+                # ✅ TTS 파일 저장
+                tts_audio_path = os.path.join(tts_output_dir, f"{translation_id}.mp3")
+                with open(tts_audio_path, "wb") as tts_file:
+                    tts_file.write(audio)
 
-                    # TTS 생성
-                    audio_generator = elevenlabs_client.text_to_speech.convert(
-                        voice_id="5Af3x6nAIWjF6agOOtOz",
-                        model_id="eleven_multilingual_v2",
-                        text=content,
-                    )
+                # ✅ 음성 파일 길이(duration) 계산
+                duration = librosa.get_duration(path=tts_audio_path)
 
-                    # TTS 파일 저장
-                    tts_audio_path = os.path.join(tts_output_dir, f"segment_{i}.mp3")
-                    with open(tts_audio_path, "wb") as tts_file:
-                        for chunk in audio_generator:
-                            tts_file.write(chunk)
-                    logging.info(f"TTS 생성 완료: {tts_audio_path}")
-                except Exception as e:
-                    logging.error(f"TTS 생성 실패 (line {i+1}): {str(e)}")
+                # ✅ DB에 저장 (start_time은 transcripts에서 가져온 값 사용)
+                curs.execute("""
+                    INSERT INTO tts (translation_id, file_path, voice, start_time, duration)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (translation_id, tts_audio_path, selected_voice_id, float(start_time), float(duration)))
 
-        logging.info("TTS 생성 완료")
-        return JSONResponse(
-            content={
-                "message": "TTS 생성이 완료되었습니다.",
-                "files": [os.path.join(tts_output_dir, f) for f in os.listdir(tts_output_dir)]
-            },
-            status_code=200
-        )
+            except Exception as e:
+                logging.error(f"TTS 생성 실패: {str(e)}")
+
+        conn.commit()
+        curs.close()
+        conn.close()
+
+        logging.info(f"TTS 생성 완료: video_id={video_id}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS 생성 실패: {str(e)}")
+    
+
+#########################
+# 📌 6. 결과물 전달
+#########################
+async def get_edit_data(video_id: int):
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+
+        # 🎥 비디오 정보 가져오기
+        curs.execute("SELECT video_id, file_name, file_path, duration FROM videos WHERE video_id = %s;", (video_id,))
+        video = curs.fetchone()
+        if not video:
+            raise HTTPException(status_code=404, detail="해당 비디오를 찾을 수 없습니다.")
+
+        video_data = {
+            "video_id": video[0],
+            "file_name": video[1],
+            "file_path": video[2],
+            "duration": float(video[3])  # np.float64 변환
+        }
+
+        # 🎼 배경음 정보 가져오기 (배경음이 있을 경우)
+        curs.execute("SELECT file_path, volume FROM background_music WHERE video_id = %s;", (video_id,))
+        bgm = curs.fetchone()
+        background_music = {
+            "file_path": bgm[0] if bgm else None,
+            "volume": float(bgm[1]) if bgm else 1.0  # 기본 볼륨 1.0
+        }
+
+        # 🎙️ TTS 트랙 정보 가져오기
+        curs.execute("""
+            SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration
+            FROM tts t
+            JOIN translations tr ON t.translation_id = tr.translation_id
+            JOIN transcripts ts ON tr.transcript_id = ts.transcript_id
+            WHERE ts.video_id = %s;
+        """, (video_id,))
+        
+        tts_tracks = [
+            {
+                "tts_id": row[0],
+                "file_path": row[1],
+                "voice": row[2],
+                "start_time": float(row[3]),  # np.float64 변환
+                "duration": float(row[4])
+            }
+            for row in curs.fetchall()
+        ]
+
+        conn.close()
+
+        # 최종 JSON 데이터
+        response_data = {
+            "video": video_data,
+            "background_music": background_music,
+            "tts_tracks": tts_tracks
+        }
+
+        return JSONResponse(content=response_data, status_code=200)
 
     except Exception as e:
-        logging.error(f"TTS 생성 실패: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"TTS 생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"데이터 조회 실패: {str(e)}")
