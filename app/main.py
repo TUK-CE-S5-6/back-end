@@ -88,38 +88,6 @@ def read_root():
     return {"message": "Hello Root!"}
 
 #########################
-# 초기화 라우트
-#########################
-@app.get("/init")
-def init_db():
-    """
-    users 테이블 생성 + 샘플 데이터 삽입
-    """
-    conn = get_connection()
-    curs = conn.cursor()
-
-    # 테이블 생성 (PostgreSQL에서 SERIAL 사용)
-    curs.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id SERIAL PRIMARY KEY,
-            username VARCHAR(50) NOT NULL UNIQUE,
-            password VARCHAR(255) NOT NULL
-        );
-    """)
-
-    # 샘플 데이터 삽입 (중복 에러 방지)
-    try:
-        curs.execute("INSERT INTO users (username, password) VALUES (%s, %s) ON CONFLICT (username) DO NOTHING;", ('Alice', 'alice123'))
-        curs.execute("INSERT INTO users (username, password) VALUES (%s, %s) ON CONFLICT (username) DO NOTHING;", ('Bob', 'bob123'))
-    except Exception as e:
-        print(f"데이터 삽입 오류: {e}")
-
-    conn.commit()
-    curs.close()
-    conn.close()
-    return {"message": "DB initialized and sample data inserted"}
-
-#########################
 # 사용자 회원가입
 #########################
 @app.post("/users", response_model=User)
@@ -239,3 +207,62 @@ async def upload_and_transcribe(file: UploadFile = File(...)):
     except Exception as e:
         logging.error(f"STT 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"STT 실패: {str(e)}")
+
+@app.post("/generate-tts")
+async def generate_tts(request: TTSRequest):
+    """
+    저장된 번역 메모장을 읽어서 영어 음성 생성
+    """
+    try:
+        logging.info("TTS 생성 시작")
+
+        file_name = request.file_name  # 파일 이름 가져오기
+        english_transcription_file = os.path.join(AUDIO_FOLDER, f"{file_name}_translation.txt")
+        tts_output_dir = os.path.join(AUDIO_FOLDER, f"{file_name}_tts")
+        os.makedirs(tts_output_dir, exist_ok=True)
+
+        if not os.path.exists(english_transcription_file):
+            raise FileNotFoundError(f"번역 파일을 찾을 수 없습니다: {english_transcription_file}")
+
+        # 번역 파일 읽기
+        with open(english_transcription_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        # ElevenLabs 클라이언트 초기화
+        elevenlabs_client = ElevenLabs(api_key="token key")  # API 키 설정
+
+        for i, line in enumerate(lines):
+            # 타임스탬프가 있고 "-"가 포함된 줄만 처리
+            if line.startswith("[") and "-" in line and "]" in line:
+                try:
+                    # 타임스탬프 뒤의 텍스트 추출
+                    content = line.split("]", 1)[1].strip()
+
+                    # TTS 생성
+                    audio_generator = elevenlabs_client.text_to_speech.convert(
+                        voice_id="5Af3x6nAIWjF6agOOtOz",
+                        model_id="eleven_multilingual_v2",
+                        text=content,
+                    )
+
+                    # TTS 파일 저장
+                    tts_audio_path = os.path.join(tts_output_dir, f"segment_{i}.mp3")
+                    with open(tts_audio_path, "wb") as tts_file:
+                        for chunk in audio_generator:
+                            tts_file.write(chunk)
+                    logging.info(f"TTS 생성 완료: {tts_audio_path}")
+                except Exception as e:
+                    logging.error(f"TTS 생성 실패 (line {i+1}): {str(e)}")
+
+        logging.info("TTS 생성 완료")
+        return JSONResponse(
+            content={
+                "message": "TTS 생성이 완료되었습니다.",
+                "files": [os.path.join(tts_output_dir, f) for f in os.listdir(tts_output_dir)]
+            },
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"TTS 생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"TTS 생성 실패: {str(e)}")
