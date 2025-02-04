@@ -17,7 +17,6 @@ charset-normalizer==3.4.1
 click==7.1.2
 colorama==0.4.6
 decorator==4.4.2
-distro==1.9.0
 elevenlabs==0.2.27
 exceptiongroup==1.2.2
 executing==2.2.0
@@ -116,7 +115,6 @@ tensorboard-data-server==0.6.1
 tensorboard-plugin-wit==1.8.1
 tensorflow==2.9.3
 tensorflow-estimator==2.9.0
-tensorflow-intel==2.11.1
 tensorflow-io-gcs-filesystem==0.31.0
 termcolor==2.5.0
 threadpoolctl==3.5.0
