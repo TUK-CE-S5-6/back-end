@@ -76,7 +76,7 @@ model = load_model(WHISPER_MODEL)
 #########################
 # OpenAI API 설정
 #########################
-OPENAI_API_KEY = "gpt-key"
+OPENAI_API_KEY = "open-ai-key"
 openai.api_key = OPENAI_API_KEY
 
 #########################
@@ -173,10 +173,34 @@ def read_user(user_id: int):
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
     return {"user_id": row[0], "username": row[1]}
 
+# 🎙️ Spleeter 실행 후, vocals.wav 및 accompaniment.wav의 실제 경로 탐색
+def find_spleeter_output(base_folder: str, file_name: str):
+    """
+    Spleeter가 생성한 vocals.wav 및 accompaniment.wav의 실제 경로를 탐색하여 반환.
+    """
+    # 1️⃣ 기본적으로 `extracted_audio/{file_name}_audio/` 폴더를 탐색
+    expected_folder = os.path.join(base_folder, f"{file_name}_audio")
+
+    if not os.path.exists(expected_folder):
+        raise FileNotFoundError(f"❌ {expected_folder} 경로가 존재하지 않습니다!")
+
+    # 2️⃣ 해당 폴더 내부에서 `vocals.wav` 및 `accompaniment.wav`를 찾기
+    for root, dirs, files in os.walk(expected_folder):
+        if "vocals.wav" in files and "accompaniment.wav" in files:
+            return os.path.join(root, "vocals.wav"), os.path.join(root, "accompaniment.wav")
+
+    raise FileNotFoundError(f"❌ '{expected_folder}' 내부에 vocals.wav 또는 accompaniment.wav를 찾을 수 없습니다!")
+
 @app.post("/upload-video")
 async def upload_video(file: UploadFile = File(...)):
     try:
+        file_name = os.path.splitext(file.filename)[0]
         file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+
+        # ✅ 기존 `extracted_audio/` 폴더 정리 (이전 처리물 삭제)
+        extracted_audio_subfolder = os.path.join(AUDIO_FOLDER, f"{file_name}_audio")
+        if os.path.exists(extracted_audio_subfolder):
+            shutil.rmtree(extracted_audio_subfolder, ignore_errors=True)
 
         # ✅ 업로드된 파일 저장
         with open(file_path, "wb") as f:
@@ -187,7 +211,7 @@ async def upload_video(file: UploadFile = File(...)):
         duration = video_clip.duration
 
         # ✅ 🎼 비디오에서 오디오 추출
-        extracted_audio_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_audio.mp3")
+        extracted_audio_path = os.path.join(AUDIO_FOLDER, f"{file_name}_audio.mp3")
         audio_clip = video_clip.audio
         audio_clip.write_audiofile(extracted_audio_path, codec='mp3')
         audio_clip.close()
@@ -196,28 +220,22 @@ async def upload_video(file: UploadFile = File(...)):
         # ✅ 🎙️ 음성과 배경음악 분리 (Spleeter 실행)
         try:
             separator = Separator("spleeter:2stems")
-            separator.separate_to_file(extracted_audio_path, AUDIO_FOLDER)  # ✅ 기존 output_dir 없이 직접 저장
+            separator.separate_to_file(extracted_audio_path, AUDIO_FOLDER)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Spleeter 실행 실패: {str(e)}")
 
-        # ✅ Spleeter가 만든 하위 폴더 자동 탐색
-        sub_dirs = [d for d in os.listdir(AUDIO_FOLDER) if os.path.isdir(os.path.join(AUDIO_FOLDER, d))]
-        if not sub_dirs:
-            raise FileNotFoundError(f"Spleeter 실행 후 '{AUDIO_FOLDER}'에 파일이 생성되지 않았습니다.")
+        # ✅ Spleeter가 생성한 실제 폴더를 탐색하여 vocals.wav, accompaniment.wav 찾기
+        vocals_path, bgm_path = find_spleeter_output(AUDIO_FOLDER, file_name)
 
-        spleeter_folder = os.path.join(AUDIO_FOLDER, sub_dirs[0])  # ✅ 자동 생성된 폴더 찾기
-        vocals_path = os.path.join(spleeter_folder, "vocals.wav")
-        bgm_path = os.path.join(spleeter_folder, "accompaniment.wav")
-
-        # ✅ 경로 정리 (불필요한 폴더 제거)
-        fixed_vocals_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_vocals.wav")
-        fixed_bgm_path = os.path.join(AUDIO_FOLDER, f"{os.path.splitext(file.filename)[0]}_bgm.wav")
+        # ✅ 최종 경로로 이동 (폴더 구조 정리)
+        fixed_vocals_path = os.path.join(AUDIO_FOLDER, f"{file_name}_vocals.wav")
+        fixed_bgm_path = os.path.join(AUDIO_FOLDER, f"{file_name}_bgm.wav")
 
         shutil.move(vocals_path, fixed_vocals_path)
         shutil.move(bgm_path, fixed_bgm_path)
 
         # ✅ Spleeter가 만든 폴더 삭제
-        shutil.rmtree(spleeter_folder)  # 🔥 불필요한 폴더 제거
+        shutil.rmtree(os.path.join(AUDIO_FOLDER, f"{file_name}_audio"), ignore_errors=True)
 
         # ✅ 📌 DB에 비디오 정보 저장
         conn = get_connection()
@@ -248,7 +266,6 @@ async def upload_video(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"업로드 실패: {str(e)}")
-
 
 #########################
 # 📌 2. STT 변환 & 저장
@@ -381,7 +398,7 @@ async def generate_tts(video_id: int):
     
 
 #########################
-# 📌 6. 결과물 전달
+# 📌 6. 결과물 전달 
 #########################
 async def get_edit_data(video_id: int):
     try:
@@ -409,9 +426,9 @@ async def get_edit_data(video_id: int):
             "volume": float(bgm[1]) if bgm else 1.0  # 기본 볼륨 1.0
         }
 
-        # 🎙️ TTS 트랙 정보 가져오기
+        # 🎙️ TTS 트랙 정보 가져오기 (번역된 텍스트 포함)
         curs.execute("""
-            SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration
+            SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration, tr.text
             FROM tts t
             JOIN translations tr ON t.translation_id = tr.translation_id
             JOIN transcripts ts ON tr.transcript_id = ts.transcript_id
@@ -424,14 +441,15 @@ async def get_edit_data(video_id: int):
                 "file_path": row[1],
                 "voice": row[2],
                 "start_time": float(row[3]),  # np.float64 변환
-                "duration": float(row[4])
+                "duration": float(row[4]),
+                "translated_text": row[5]  # ✅ 번역된 텍스트 추가
             }
             for row in curs.fetchall()
         ]
 
         conn.close()
 
-        # 최종 JSON 데이터
+        # ✅ 최종 JSON 데이터 (번역된 텍스트 포함)
         response_data = {
             "video": video_data,
             "background_music": background_music,
@@ -442,3 +460,4 @@ async def get_edit_data(video_id: int):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 조회 실패: {str(e)}")
+    
