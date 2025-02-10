@@ -21,3 +21,6 @@ pip install -r requirements.txt
 
 깃 commit 되돌리기:
 git reset --soft HEAD~1
+
+python -m venv venv
+venv\Scripts\activate
