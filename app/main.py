@@ -4,17 +4,18 @@ import openai
 import psycopg2
 import numpy as np
 import librosa
+import shutil
+import logging
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from whisper import load_model
 from moviepy.editor import AudioFileClip, VideoFileClip
-import logging
 from elevenlabs import set_api_key, generate, Voice
 from spleeter.separator import Separator
-import shutil
 from fastapi.staticfiles import StaticFiles
+from typing import Optional
 
 #########################
 # PostgreSQL 설정
@@ -65,6 +66,7 @@ class TTSRequest(BaseModel):
     file_name: str
     
 class CustomTTSRequest(BaseModel):
+    tts_id: Optional[int] = None  # ❗ 기본값을 None으로 설정하여 선택적으로 입력 가능하게 함
     voice_id: str
     text: str
 
@@ -73,6 +75,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 AUDIO_FOLDER = "extracted_audio"
 os.makedirs(AUDIO_FOLDER, exist_ok=True)
+
+CUSTOM_TTS_FOLDER = os.path.join(AUDIO_FOLDER, "custom_tts")
+os.makedirs(CUSTOM_TTS_FOLDER, exist_ok=True)
 
 WHISPER_MODEL = "large"
 model = load_model(WHISPER_MODEL)
@@ -474,38 +479,79 @@ async def get_edit_data(video_id: int):
 @app.post("/generate-tts")
 async def generate_tts_custom(request: CustomTTSRequest):
     try:
-        # ✅ TTS 출력을 저장할 경로 설정
-        tts_output_dir = os.path.join(AUDIO_FOLDER, "custom_tts")
-        os.makedirs(tts_output_dir, exist_ok=True)
+        conn = get_connection()
+        curs = conn.cursor()
 
-        # ✅ TTS 파일명 생성 (시간 기반)
-        timestamp = int(time.time())
-        tts_audio_path = os.path.join(tts_output_dir, f"tts_{timestamp}.mp3")
+        # ✅ 기존 TTS를 업데이트하는 경우
+        if request.tts_id is not None:
+            # 해당 tts_id가 존재하는지 확인
+            curs.execute("SELECT translation_id, file_path FROM tts WHERE tts_id = %s;", (request.tts_id,))
+            row = curs.fetchone()
 
-        # ✅ ElevenLabs TTS 생성
-        try:
-            voice = Voice(voice_id=request.voice_id)
+            if not row:
+                raise HTTPException(status_code=404, detail="해당 tts_id를 찾을 수 없습니다.")
 
-            audio = generate(
-                text=request.text,
-                voice=voice,  
-                model="eleven_multilingual_v2"
+            translation_id, tts_audio_path = row
+
+            # ✅ 기존 번역 데이터 업데이트
+            curs.execute("UPDATE translations SET text = %s WHERE translation_id = %s;", (request.text, translation_id))
+
+            # ✅ 새로운 음성 파일 생성 (기존 파일명 유지하여 덮어쓰기)
+            try:
+                voice = Voice(voice_id=request.voice_id)
+                audio = generate(text=request.text, voice=voice, model="eleven_multilingual_v2")
+
+                # ✅ 기존 TTS 파일을 덮어쓰기
+                with open(tts_audio_path, "wb") as tts_file:
+                    tts_file.write(audio)
+
+                # ✅ 음성 길이(duration) 업데이트
+                duration = librosa.get_duration(path=tts_audio_path)
+
+                curs.execute(
+                    "UPDATE tts SET voice = %s, duration = %s WHERE tts_id = %s;",
+                    (request.voice_id, duration, request.tts_id)
+                )
+
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"ElevenLabs TTS 생성 실패: {str(e)}")
+
+        else:
+            # ✅ 새로운 TTS 생성 (tts_id가 없을 경우, custom_tts 폴더에 저장)
+            timestamp = int(time.time())
+            tts_audio_path = os.path.join(CUSTOM_TTS_FOLDER, f"tts_{timestamp}.mp3")
+
+            try:
+                voice = Voice(voice_id=request.voice_id)
+                audio = generate(text=request.text, voice=voice, model="eleven_multilingual_v2")
+
+                with open(tts_audio_path, "wb") as tts_file:
+                    tts_file.write(audio)
+
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"ElevenLabs TTS 생성 실패: {str(e)}")
+
+            # ✅ 번역 데이터 저장
+            curs.execute("INSERT INTO translations (text, language) VALUES (%s, %s) RETURNING translation_id;", (request.text, "en"))
+            translation_id = curs.fetchone()[0]
+
+            # ✅ TTS 데이터 삽입 (새로운 tts_id 생성)
+            duration = librosa.get_duration(path=tts_audio_path)
+            curs.execute(
+                "INSERT INTO tts (translation_id, file_path, voice, start_time, duration) VALUES (%s, %s, %s, %s, %s) RETURNING tts_id;",
+                (translation_id, tts_audio_path, request.voice_id, 0.0, duration)
             )
 
-            # ✅ 생성된 음성을 파일로 저장
-            with open(tts_audio_path, "wb") as tts_file:
-                tts_file.write(audio)
+            request.tts_id = curs.fetchone()[0]  # 새로 생성된 tts_id 저장
 
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"ElevenLabs TTS 생성 실패: {str(e)}")
+        # ✅ DB 커밋 & 연결 종료
+        conn.commit()
+        curs.close()
+        conn.close()
 
-        # ✅ 생성된 음성 파일의 URL 반환
-        tts_file_url = f"/extracted_audio/custom_tts/tts_{timestamp}.mp3"
-
-        return JSONResponse(
-            content={"message": "TTS 생성 완료", "file_url": tts_file_url}, 
-            status_code=200
-        )
+        # ✅ 기존 파일명을 유지한 채 새로운 TTS를 덮어쓰므로 파일 경로 변경 없음
+        tts_file_url = tts_audio_path.replace(AUDIO_FOLDER, "/extracted_audio")
+        return JSONResponse(content={"message": "TTS 생성 완료", "file_url": tts_file_url, "tts_id": request.tts_id}, status_code=200)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
