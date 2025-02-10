@@ -63,6 +63,10 @@ class User(BaseModel):
 
 class TTSRequest(BaseModel):
     file_name: str
+    
+class CustomTTSRequest(BaseModel):
+    voice_id: str
+    text: str
 
 UPLOAD_FOLDER = "uploaded_videos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -76,7 +80,7 @@ model = load_model(WHISPER_MODEL)
 #########################
 # OpenAI API 설정
 #########################
-OPENAI_API_KEY = "open-ai-key"
+OPENAI_API_KEY = "gpt-key"
 openai.api_key = OPENAI_API_KEY
 
 #########################
@@ -191,6 +195,9 @@ def find_spleeter_output(base_folder: str, file_name: str):
 
     raise FileNotFoundError(f"❌ '{expected_folder}' 내부에 vocals.wav 또는 accompaniment.wav를 찾을 수 없습니다!")
 
+#########################
+# 📌 영상 업로드 & 음원 분리
+#########################
 @app.post("/upload-video")
 async def upload_video(file: UploadFile = File(...)):
     try:
@@ -268,7 +275,7 @@ async def upload_video(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"업로드 실패: {str(e)}")
 
 #########################
-# 📌 2. STT 변환 & 저장
+# 📌 STT 변환 & 저장
 #########################
 async def transcribe_audio(audio_path: str, video_id: int):
     try:
@@ -298,7 +305,7 @@ async def transcribe_audio(audio_path: str, video_id: int):
         raise HTTPException(status_code=500, detail=f"STT 실패: {str(e)}")
     
 #########################
-# 📌 4. 번역 & 저장 (자동 실행)
+# 📌 번역 & 저장 (자동 실행)
 #########################
 async def translate_video(video_id: int):
     try:
@@ -334,7 +341,7 @@ async def translate_video(video_id: int):
         raise HTTPException(status_code=500, detail=f"번역 실패: {str(e)}")
 
 #########################
-# 📌 5. TTS 변환 & 저장 (자동 실행)
+# 📌 TTS 변환 & 저장 (자동 실행)
 #########################
 async def generate_tts(video_id: int):
     try:
@@ -398,7 +405,7 @@ async def generate_tts(video_id: int):
     
 
 #########################
-# 📌 6. 결과물 전달 
+# 📌 결과물 전달 
 #########################
 async def get_edit_data(video_id: int):
     try:
@@ -460,4 +467,45 @@ async def get_edit_data(video_id: int):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 조회 실패: {str(e)}")
-    
+
+#########################
+# 📌 사용자 입력 기반 TTS 생성
+#########################
+@app.post("/generate-tts")
+async def generate_tts_custom(request: CustomTTSRequest):
+    try:
+        # ✅ TTS 출력을 저장할 경로 설정
+        tts_output_dir = os.path.join(AUDIO_FOLDER, "custom_tts")
+        os.makedirs(tts_output_dir, exist_ok=True)
+
+        # ✅ TTS 파일명 생성 (시간 기반)
+        timestamp = int(time.time())
+        tts_audio_path = os.path.join(tts_output_dir, f"tts_{timestamp}.mp3")
+
+        # ✅ ElevenLabs TTS 생성
+        try:
+            voice = Voice(voice_id=request.voice_id)
+
+            audio = generate(
+                text=request.text,
+                voice=voice,  
+                model="eleven_multilingual_v2"
+            )
+
+            # ✅ 생성된 음성을 파일로 저장
+            with open(tts_audio_path, "wb") as tts_file:
+                tts_file.write(audio)
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"ElevenLabs TTS 생성 실패: {str(e)}")
+
+        # ✅ 생성된 음성 파일의 URL 반환
+        tts_file_url = f"/extracted_audio/custom_tts/tts_{timestamp}.mp3"
+
+        return JSONResponse(
+            content={"message": "TTS 생성 완료", "file_url": tts_file_url}, 
+            status_code=200
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
