@@ -13,6 +13,8 @@ taskkill /PID <PID> /F
 서버 실행:
 uvicorn app.main:app --reload --port 8000
 uvicorn app.main:app --port 8000
+uvicorn app.service_a:app  --host 0.0.0.0 --port 8000
+uvicorn app.service_b:app  --host 0.0.0.0 --port 8001
 
 설치된 pip 정리:
 pip freeze > requirements.txt
@@ -24,3 +26,4 @@ git reset --soft HEAD~1
 
 python -m venv venv
 venv\Scripts\activate
+deactivate
