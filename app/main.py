@@ -2,20 +2,22 @@ import os
 import time
 import openai
 import psycopg2
-import numpy as np
 import librosa
 import shutil
 import logging
-from fastapi import FastAPI, HTTPException, UploadFile, File
+import requests
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from whisper import load_model
-from moviepy.editor import AudioFileClip, VideoFileClip
-from elevenlabs import set_api_key, generate, Voice
+from moviepy.editor import VideoFileClip
+from elevenlabs import Voice, generate, Voices, set_api_key
 from spleeter.separator import Separator
 from fastapi.staticfiles import StaticFiles
 from typing import Optional
+from pydub import AudioSegment
+
 
 #########################
 # PostgreSQL 설정
@@ -51,24 +53,25 @@ app.add_middleware(
 app.mount("/videos", StaticFiles(directory="uploaded_videos"), name="videos")
 app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
 
+
 #########################
 # Pydantic 모델
 #########################
 class UserCreate(BaseModel):
     username: str
     password: str
-
 class User(BaseModel):
     user_id: int
     username: str
-
 class TTSRequest(BaseModel):
     file_name: str
-    
 class CustomTTSRequest(BaseModel):
     tts_id: Optional[int] = None  # ❗ 기본값을 None으로 설정하여 선택적으로 입력 가능하게 함
     voice_id: str
     text: str
+class VoiceModelRequest(BaseModel):
+    name: str
+    description: str
 
 UPLOAD_FOLDER = "uploaded_videos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -78,6 +81,10 @@ os.makedirs(AUDIO_FOLDER, exist_ok=True)
 
 CUSTOM_TTS_FOLDER = os.path.join(AUDIO_FOLDER, "custom_tts")
 os.makedirs(CUSTOM_TTS_FOLDER, exist_ok=True)
+
+# 🔹 음성 모델 저장 디렉토리
+VOICE_MODEL_FOLDER = "voice_models"
+os.makedirs(VOICE_MODEL_FOLDER, exist_ok=True)
 
 WHISPER_MODEL = "large"
 model = load_model(WHISPER_MODEL)
@@ -93,6 +100,7 @@ openai.api_key = OPENAI_API_KEY
 #########################
 ELEVENLABS_API_KEY = "eleven-key"
 set_api_key(ELEVENLABS_API_KEY)
+ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1"
 
 #########################
 # PostgreSQL 연결 함수
@@ -555,3 +563,125 @@ async def generate_tts_custom(request: CustomTTSRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
+
+def create_voice_model_api(name: str, description: str, sample_file_paths: list):
+    """
+    ElevenLabs API에 보이스 모델 생성 요청을 보냅니다.
+    모든 샘플 파일을 한 번에 포함하여 multipart/form-data 요청으로 전송합니다.
+    """
+    url = f"{ELEVENLABS_BASE_URL}/voices/add"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY
+    }
+    data = {
+        "name": name,
+        "description": description
+    }
+    files = []
+    # sample_file_paths에 있는 모든 파일을 "files" 필드로 추가
+    for path in sample_file_paths:
+        try:
+            f = open(path, "rb")
+        except Exception as e:
+            logging.error(f"파일 열기 실패 ({path}): {str(e)}")
+            continue
+        files.append(
+            ("files", (os.path.basename(path), f, "audio/mpeg"))
+        )
+    try:
+        response = requests.post(url, headers=headers, data=data, files=files)
+        response.raise_for_status()
+        return response.json()
+    finally:
+        # 열었던 모든 파일 객체 닫기
+        for _, file_tuple in files:
+            file_obj = file_tuple[1]
+            file_obj.close()
+
+def split_audio(input_path: str, output_dir: str, max_size_mb: int = 10):
+    """🔹 오디오 파일을 max_size_mb (기본 10MB) 이하로 분할"""
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        audio = AudioSegment.from_file(input_path)
+        total_length_ms = len(audio)  # 전체 길이 (ms)
+        bitrate = 192000  # MP3 비트레이트 (192kbps)
+        # 최대 지속시간(초): (max_size_mb * 8,000,000) / bitrate
+        max_duration_sec = (max_size_mb * 8000000) / bitrate  
+        max_duration_ms = int(max_duration_sec * 1000)  # ms 단위
+        
+        parts = []
+        for i in range(0, total_length_ms, max_duration_ms):
+            part = audio[i : i + max_duration_ms]
+            part_path = os.path.join(output_dir, f"part_{len(parts)}.mp3")
+            part.export(part_path, format="mp3", bitrate="192k")
+            parts.append(part_path)
+        
+        logging.info(f"🔹 분할된 파일 개수: {len(parts)}")
+        return parts
+
+    except Exception as e:
+        logging.error(f"❌ 오디오 분할 실패: {str(e)}")
+        return []
+
+# FastAPI 엔드포인트 수정 (모든 샘플 파일을 한 번에 보냄)
+@app.post("/create-voice-model")
+async def create_voice_model(
+    name: str = Form(...),
+    description: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """
+    ElevenLabs API를 호출하여 보이스 모델을 생성한 후,
+    업로드된 오디오 파일을 10MB 이하 단위로 분할하고,
+    분할된 모든 샘플 파일을 포함하여 보이스 모델 생성 요청을 보냅니다.
+    생성된 보이스 모델 정보는 DB의 voice_models 테이블에 저장됩니다.
+    """
+    try:
+        file_name = os.path.splitext(file.filename)[0]
+        file_path = os.path.join(AUDIO_FOLDER, f"{file_name}.mp3")
+        logging.info(f"📥 파일 저장 시작: {file.filename}")
+
+        # 업로드된 오디오 파일 저장
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # 오디오 파일 분할 (각 조각이 10MB 이하)
+        split_dir = os.path.join(AUDIO_FOLDER, f"{file_name}_parts")
+        parts = split_audio(file_path, split_dir)
+        if not parts:
+            raise HTTPException(status_code=500, detail="파일 분할 실패")
+
+        # 모든 분할 파일을 포함하여 보이스 모델 생성 API 호출
+        voice_response = create_voice_model_api(name=name, description=description, sample_file_paths=parts)
+        voice_id = voice_response.get("voice_id")
+        if not voice_id:
+            raise Exception("보이스 모델 생성 실패: voice_id가 반환되지 않음")
+        logging.info(f"✅ 보이스 모델 생성 완료: {voice_id}")
+
+        # 보이스 모델 정보를 DB에 저장
+        conn = get_connection()
+        curs = conn.cursor()
+        curs.execute(
+            "INSERT INTO voice_models (voice_id, name, description) VALUES (%s, %s, %s) RETURNING id;",
+            (voice_id, name, description)
+        )
+        inserted_id = curs.fetchone()[0]
+        conn.commit()
+        curs.close()
+        conn.close()
+        logging.info(f"📌 DB에 voice_models 테이블에 저장 완료 (id: {inserted_id})")
+
+        return JSONResponse(
+            content={
+                "message": "보이스 모델 생성 완료",
+                "voice_id": voice_id,
+                "name": name,
+                "description": description,
+                "db_id": inserted_id,
+            },
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"❌ 보이스 모델 생성 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"보이스 모델 생성 실패: {str(e)}")
