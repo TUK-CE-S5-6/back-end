@@ -161,7 +161,7 @@ async def transcribe_audio(audio_path: str, video_id: int):
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"STT 변환 실패: {audio_path} 파일이 존재하지 않습니다.")
         
-        # 화자 다이어리제이션 수행 (EEND)
+        # 화자 다이어리제이션 수행 (EEND 기반, pyannote.audio 사용)
         segments = diarize_audio_eend(audio_path)
         
         # 전체 오디오 로드 (pydub 사용)
@@ -174,6 +174,12 @@ async def transcribe_audio(audio_path: str, video_id: int):
             start_sec = seg["start"]
             end_sec = seg["end"]
             speaker = seg["speaker"]
+            duration_sec = end_sec - start_sec
+            
+            # 짧은 세그먼트(예: 0.5초 미만)는 스킵
+            if duration_sec < 0.5:
+                continue
+
             start_ms = int(start_sec * 1000)
             end_ms = int(end_sec * 1000)
             
@@ -184,9 +190,15 @@ async def transcribe_audio(audio_path: str, video_id: int):
             
             # Whisper를 이용한 STT 수행
             result = model.transcribe(temp_segment_path, word_timestamps=True)
-            text = result.get("text", "").strip()
+            # 반환 결과의 타입에 따라 text 추출
+            if isinstance(result, dict):
+                text = result.get("text", "").strip()
+            elif isinstance(result, tuple) and len(result) > 0:
+                text = result[0].strip()
+            else:
+                text = ""
             
-            # DB에 화자 정보와 함께 전사 결과 저장 (transcripts 테이블에 speaker 컬럼 존재)
+            # DB에 화자 정보와 함께 전사 결과 저장
             curs.execute(
                 """
                 INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
@@ -201,6 +213,7 @@ async def transcribe_audio(audio_path: str, video_id: int):
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT 실패: {str(e)}")
+
 
 # -----------------------------------------------------------------
 # 번역 및 DB 저장
