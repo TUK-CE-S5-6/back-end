@@ -24,6 +24,9 @@ pip install -r requirements.txt
 깃 commit 되돌리기:
 git reset --soft HEAD~1
 
+가상환경 코드: 
 python -m venv venv
 venv\Scripts\activate
+env-service-a\Scripts\activate
+env-service-b\Scripts\activate
 deactivate

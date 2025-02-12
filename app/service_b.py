@@ -82,7 +82,63 @@ def get_connection():
 def read_root():
     return {"message": "Hello from Service B (TTS Creation)!"}
 
-# --- 새로운 엔드포인트: STT 결과를 받아 TTS 생성 ---
+# ----------------------------
+# Spleeter를 이용한 오디오 분리 엔드포인트
+# ----------------------------
+@app.post("/separate-audio")
+async def separate_audio(file: UploadFile = File(...)):
+    try:
+        # 1. 파일 저장
+        original_name = os.path.splitext(file.filename)[0]
+        # base_name: "_audio"가 포함되어 있다면 제거하여 기본 이름으로 사용
+        base_name = original_name[:-len("_audio")] if original_name.endswith("_audio") else original_name
+        input_path = os.path.join(AUDIO_FOLDER, f"{base_name}.mp3")
+        with open(input_path, "wb") as f:
+            f.write(await file.read())
+        logging.info(f"입력 오디오 저장 완료: {input_path}")
+
+        # 2. Spleeter 실행 (2 stems: vocals + accompaniment)
+        from spleeter.separator import Separator
+        separator = Separator("spleeter:2stems")
+        separator.separate_to_file(input_path, AUDIO_FOLDER)
+        logging.info("Spleeter 분리 실행 완료")
+
+        # 3. 분리 결과 폴더에서 vocals와 accompaniment 파일 찾기
+        def find_spleeter_output(base_folder: str, base_name: str):
+            expected_folder = os.path.join(base_folder, f"{base_name}")
+            if not os.path.exists(expected_folder):
+                raise FileNotFoundError(f"❌ {expected_folder} 경로가 존재하지 않습니다!")
+            vocals_path = None
+            bgm_path = None
+            for root, dirs, files in os.walk(expected_folder):
+                if "vocals.wav" in files:
+                    vocals_path = os.path.join(root, "vocals.wav")
+                if "accompaniment.wav" in files:
+                    bgm_path = os.path.join(root, "accompaniment.wav")
+            if not vocals_path or not bgm_path:
+                raise FileNotFoundError("vocals.wav 또는 accompaniment.wav를 찾을 수 없습니다!")
+            return vocals_path, bgm_path
+
+        vocals_path, bgm_path = find_spleeter_output(AUDIO_FOLDER, base_name)
+        logging.info(f"분리된 파일 찾음: vocals={vocals_path}, bgm={bgm_path}")
+
+        # 결과 반환 (URL 경로 변환)
+        return JSONResponse(
+            content={
+                "message": "Spleeter 분리 완료",
+                "vocals_path": vocals_path,  # URL 치환 없이 실제 파일 경로 반환
+                "bgm_path": bgm_path
+            },
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.error(f"Spleeter 처리 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Spleeter 처리 실패: {str(e)}")
+
+# ----------------------------
+# STT 결과를 받아 TTS 생성 엔드포인트
+# ----------------------------
 @app.post("/generate-tts-from-stt")
 async def generate_tts_from_stt(data: dict):
     try:
@@ -127,7 +183,10 @@ async def generate_tts_from_stt(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
 
-# --- 기존 TTS 생성 (사용자 입력 기반) 엔드포인트 ---
+
+# ----------------------------
+# 기존 TTS 생성 (사용자 입력 기반) 엔드포인트
+# ----------------------------
 @app.post("/generate-tts")
 async def generate_tts_custom(request: CustomTTSRequest):
     try:
@@ -178,6 +237,7 @@ async def generate_tts_custom(request: CustomTTSRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
 
+
 def create_voice_model_api(name: str, description: str, sample_file_paths: list):
     url = f"{ELEVENLABS_BASE_URL}/voices/add"
     headers = {"xi-api-key": ELEVENLABS_API_KEY}
@@ -201,6 +261,7 @@ def create_voice_model_api(name: str, description: str, sample_file_paths: list)
     finally:
         for _, file_tuple in files:
             file_tuple[1].close()
+
 
 def split_audio(input_path: str, output_dir: str, max_size_mb: int = 10):
     os.makedirs(output_dir, exist_ok=True)
@@ -227,6 +288,7 @@ def split_audio(input_path: str, output_dir: str, max_size_mb: int = 10):
         logging.error(f"❌ 오디오 분할 실패: {str(e)}")
         return []
 
+
 def merge_nonsilent_audio_improved(input_path: str, output_dir: str, min_silence_len: int = 500, silence_thresh: float = None, output_filename: str = "merged_sample.mp3", fade_duration: int = 200):
     os.makedirs(output_dir, exist_ok=True)
     try:
@@ -248,6 +310,7 @@ def merge_nonsilent_audio_improved(input_path: str, output_dir: str, min_silence
     except Exception as e:
         logging.error(f"❌ 병합 실패: {str(e)}")
         return None
+
 
 def split_merged_audio(merged_path: str, output_dir: str, max_duration_sec: int = 30, max_samples: int = 25):
     os.makedirs(output_dir, exist_ok=True)
@@ -276,6 +339,7 @@ def split_merged_audio(merged_path: str, output_dir: str, max_duration_sec: int 
         logging.error(f"❌ 병합 후 분할 실패: {str(e)}")
         return []
 
+
 @app.post("/create-voice-model")
 async def create_voice_model(
     name: str = Form(...),
@@ -291,9 +355,10 @@ async def create_voice_model(
     작업 완료 후 임시 파일들을 삭제합니다.
     """
     try:
-        file_name = os.path.splitext(file.filename)[0]
+        original_name = os.path.splitext(file.filename)[0]
+        base_name = original_name[:-len("_audio")] if original_name.endswith("_audio") else original_name
         
-        original_path = os.path.join(AUDIO_FOLDER, f"{file_name}.mp3")
+        original_path = os.path.join(AUDIO_FOLDER, f"{base_name}.mp3")
         logging.info(f"📥 파일 저장 시작: {file.filename}")
         with open(original_path, "wb") as f:
             f.write(await file.read())
@@ -305,37 +370,38 @@ async def create_voice_model(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Spleeter 실행 실패: {str(e)}")
         
-        def find_spleeter_vocals(base_folder: str, file_name: str):
-            primary_folder = os.path.join(base_folder, file_name)
+        def find_spleeter_vocals(base_folder: str, base_name: str):
+            # 우선 기본 폴더(base_name)에서 찾고 없으면 base_name_audio 폴더에서 찾음
+            primary_folder = os.path.join(base_folder, base_name)
             if os.path.exists(primary_folder):
                 for root, dirs, files in os.walk(primary_folder):
                     if "vocals.wav" in files:
                         return os.path.join(root, "vocals.wav")
-            alternate_folder = os.path.join(base_folder, f"{file_name}_audio")
+            alternate_folder = os.path.join(base_folder, f"{base_name}_audio")
             if os.path.exists(alternate_folder):
                 for root, dirs, files in os.walk(alternate_folder):
                     if "vocals.wav" in files:
                         return os.path.join(root, "vocals.wav")
             raise FileNotFoundError(f"❌ '{base_folder}' 내에 vocals.wav를 찾을 수 없습니다!")
         
-        vocal_path = find_spleeter_vocals(AUDIO_FOLDER, file_name)
-        fixed_vocal_path = os.path.join(AUDIO_FOLDER, f"{file_name}_vocals.wav")
+        vocal_path = find_spleeter_vocals(AUDIO_FOLDER, base_name)
+        fixed_vocal_path = os.path.join(AUDIO_FOLDER, f"{base_name}_vocals.wav")
         shutil.move(vocal_path, fixed_vocal_path)
-        # 추가: Spleeter가 생성한 원본 폴더 삭제 (예: <file_name> 폴더가 존재하면 삭제)
-        folder_primary = os.path.join(AUDIO_FOLDER, file_name)
+        # Spleeter가 생성한 원본 폴더 삭제
+        folder_primary = os.path.join(AUDIO_FOLDER, base_name)
         if os.path.exists(folder_primary):
             shutil.rmtree(folder_primary, ignore_errors=True)
-        folder_alternate = os.path.join(AUDIO_FOLDER, f"{file_name}_audio")
+        folder_alternate = os.path.join(AUDIO_FOLDER, f"{base_name}_audio")
         if os.path.exists(folder_alternate):
             shutil.rmtree(folder_alternate, ignore_errors=True)
         
-        merge_dir = os.path.join(AUDIO_FOLDER, f"{file_name}_merged")
+        merge_dir = os.path.join(AUDIO_FOLDER, f"{base_name}_merged")
         os.makedirs(merge_dir, exist_ok=True)
         merged_sample_path = merge_nonsilent_audio_improved(fixed_vocal_path, merge_dir, output_filename="merged_sample.mp3", fade_duration=200)
         if not merged_sample_path:
             raise HTTPException(status_code=500, detail="병합 파일 생성 실패")
         
-        split_dir = os.path.join(AUDIO_FOLDER, f"{file_name}_split")
+        split_dir = os.path.join(AUDIO_FOLDER, f"{base_name}_split")
         os.makedirs(split_dir, exist_ok=True)
         MAX_MERGED_DURATION_SEC = 30
         sample_parts = split_merged_audio(merged_sample_path, split_dir, max_duration_sec=MAX_MERGED_DURATION_SEC, max_samples=25)
