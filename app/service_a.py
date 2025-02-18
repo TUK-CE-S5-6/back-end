@@ -4,7 +4,7 @@ import openai
 import psycopg2
 import requests
 import asyncio
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -22,9 +22,9 @@ DB_HOST = "localhost"
 DB_PORT = "5433"
 
 # Clova Speech Long Sentence API 설정
-# 아래 값을 네이버 클라우드 플랫폼에서 발급받은 Secret Key와 Invoke URL로 교체하세요.
+# 실제 발급받은 Secret Key와 Invoke URL로 교체하세요.
 NAVER_CLOVA_SECRET_KEY = "clova-key"  
-NAVER_CLOVA_SPEECH_URL = "clova-url"
+NAVER_CLOVA_SPEECH_URL = "invoke-url"
 
 # OpenAI API 설정 (번역용)
 OPENAI_API_KEY = "gpt-key"
@@ -73,20 +73,22 @@ class User(BaseModel):
     user_id: int
     username: str
 
-# Clova Speech Long Sentence STT 호출 함수 (Secret Key만 사용)
+############################################
+# Clova Speech Long Sentence STT 호출 함수 (Secret Key 사용)
+############################################
 def clova_speech_stt(file_path: str, completion="sync", language="ko-KR", 
-                     wordAlignment=True, fullText=True, diarization=None) -> str:
+                     wordAlignment=True, fullText=True,
+                     speakerCountMin=-1, speakerCountMax=-1) -> dict:
     """
     주어진 오디오 파일(file_path)을 Clova Speech Long Sentence API를 통해 전송하여,
-    인식된 텍스트를 반환합니다.
-    - completion: "sync" (동기) 또는 "async" (비동기)
-    - language: 인식 언어 (예: "ko-KR")
-    - wordAlignment, fullText: 옵션 (기본값 true)
-    - diarization: 화자 인식 옵션 (없으면 기본값 사용)
+    인식 결과 전체 JSON을 반환합니다.
     """
-    # diarization 옵션이 제공되지 않은 경우 기본값 설정
-    if diarization is None:
-        diarization = {"enable": True, "speakerCountMin": -1, "speakerCountMax": -1}
+    # diarization 옵션 설정 (여기서는 최소 화자 수는 1로 고정, 최대 화자 수는 전달받은 값을 사용)
+    diarization = {
+        "enable": True,
+        "speakerCountMin": 1,
+        "speakerCountMax": speakerCountMax
+    }
     request_body = {
         "language": language,
         "completion": completion,
@@ -98,7 +100,6 @@ def clova_speech_stt(file_path: str, completion="sync", language="ko-KR",
         "Accept": "application/json; charset=UTF-8",
         "X-CLOVASPEECH-API-KEY": NAVER_CLOVA_SECRET_KEY
     }
-    # 로컬 파일 업로드 방식: 파일과 함께 JSON 인코딩된 파라미터 전송
     files = {
         "media": open(file_path, "rb"),
         "params": (None, json.dumps(request_body).encode("UTF-8"), "application/json")
@@ -108,114 +109,71 @@ def clova_speech_stt(file_path: str, completion="sync", language="ko-KR",
     files["media"].close()
     if response.status_code != 200:
         print("Clova Speech Long Sentence API 호출 실패:", response.status_code, response.text)
-        return ""
+        return {}
     result = response.json()
-    return result.get("text", "")
+    return result
 
-# -----------------------------------------------------------------
-# 화자 다이어리제이션 함수 (pyannote.audio 사용)
-# -----------------------------------------------------------------
-def diarize_audio_eend(input_path: str):
-    """
-    입력 오디오 파일(input_path)을 받아 화자 다이어리제이션을 수행한 후,
-    각 세그먼트의 시작/종료 시간과 화자 라벨을 포함한 리스트를 반환합니다.
-    """
-    # mp3이면 wav로 변환
-    if not input_path.lower().endswith('.wav'):
-        wav_path = os.path.splitext(input_path)[0] + '.wav'
-        sound = AudioSegment.from_file(input_path)
-        sound.export(wav_path, format="wav")
-    else:
-        wav_path = input_path
-
-    pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization")
-    diarization = pipeline(wav_path)
-    
-    segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segments.append({
-            "start": turn.start,
-            "end": turn.end,
-            "speaker": speaker
-        })
-    return segments
-
-# -----------------------------------------------------------------
-# 각 세그먼트를 처리하는 함수 (Clova Speech Long Sentence STT 사용)
-# -----------------------------------------------------------------
-def process_segment(seg, audio, video_id):
-    """
-    각 세그먼트를 처리하여 Clova Speech Long Sentence STT 결과와 관련 정보를 반환합니다.
-    """
-    start_sec = seg["start"]
-    end_sec = seg["end"]
-    speaker = seg["speaker"]
-
-    if end_sec - start_sec <= 0:
-        return {"start": start_sec, "end": end_sec, "speaker": speaker, "text": ""}
-
-    start_ms = int(start_sec * 1000)
-    end_ms = int(end_sec * 1000)
-
-    segment_audio = audio[start_ms:end_ms]
-    temp_segment_path = os.path.join("temp_segments", f"{video_id}_{start_ms}_{end_ms}.wav")
-    segment_audio.export(temp_segment_path, format="wav")
-
-    # Clova Speech Long Sentence STT 호출 (동기 모드)
-    text = clova_speech_stt(temp_segment_path, completion="sync").strip()
-
-    os.remove(temp_segment_path)
-
-    return {
-        "start": start_sec,
-        "end": end_sec,
-        "speaker": speaker,
-        "text": text,
-    }
-
-# -----------------------------------------------------------------
-# STT 변환 (화자 다이어리제이션 + Clova Speech Long Sentence STT, 병렬 처리 적용)
-# -----------------------------------------------------------------
+############################################
+# STT 변환 (Clova Speech Long Sentence STT 사용, 화자 인식 포함)
+############################################
 async def transcribe_audio(audio_path: str, video_id: int):
-    step_times = {}
+    """
+    추출된 오디오 파일을 Clova Speech Long Sentence API에 업로드하여 STT를 수행하고,
+    API가 반환한 diarization 결과(세그먼트)를 DB에 저장합니다.
+    최소 화자 수는 1로 고정하고, 최대 화자 수는 내부 기본값(예: 2)으로 사용합니다.
+    """
     step_start = time.time()
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"STT 변환 실패: {audio_path} 파일이 존재하지 않습니다.")
     
-    diarization_start = time.time()
-    segments = diarize_audio_eend(audio_path)
-    step_times["diarization_time"] = time.time() - diarization_start
-
-    audio = AudioSegment.from_file(audio_path)
-    os.makedirs("temp_segments", exist_ok=True)
-
-    tasks = [
-        asyncio.to_thread(process_segment, seg, audio, video_id)
-        for seg in segments
-    ]
-    segment_results = await asyncio.gather(*tasks)
-
+    # 내부 기본 최대 화자 수를 2로 설정
+    result = clova_speech_stt(
+        audio_path,
+        completion="sync",
+        language="ko-KR",
+        wordAlignment=True,
+        fullText=True,
+        speakerCountMin=1,
+        speakerCountMax=3
+    )
+    if not result:
+        raise HTTPException(status_code=500, detail="Clova Speech STT 호출 실패")
+    
     conn = get_connection()
     curs = conn.cursor()
-    for res in segment_results:
+    if "segments" in result:
+        for seg in result["segments"]:
+            # Clova API의 세그먼트 시간은 밀리초 단위이므로 초 단위로 변환
+            start_sec = seg.get("start", 0) / 1000.0
+            end_sec = seg.get("end", 0) / 1000.0
+            text = seg.get("text", "")
+            speaker_info = seg.get("speaker", {})
+            speaker = speaker_info.get("name", speaker_info.get("label", ""))
+            curs.execute(
+                """
+                INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
+                VALUES (%s, %s, %s, %s, %s, %s);
+                """,
+                (video_id, "ko", text, start_sec, end_sec, speaker)
+            )
+    else:
         curs.execute(
             """
             INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
             VALUES (%s, %s, %s, %s, %s, %s);
             """,
-            (video_id, "ko", res["text"], res["start"], res["end"], res["speaker"])
+            (video_id, "ko", result.get("text", ""), 0, 0, "")
         )
     conn.commit()
     curs.close()
     conn.close()
 
     stt_time = time.time() - step_start
-    step_times["stt_time"] = stt_time
-    return step_times
+    return {"stt_time": stt_time}
 
-# -----------------------------------------------------------------
+############################################
 # 번역 및 DB 저장
-# -----------------------------------------------------------------
+############################################
 async def translate_video(video_id: int):
     step_start = time.time()
     conn = get_connection()
@@ -245,9 +203,9 @@ async def translate_video(video_id: int):
     conn.close()
     return {"translation_time": time.time() - step_start}
 
-# -----------------------------------------------------------------
+############################################
 # 최종 결과 조회 엔드포인트
-# -----------------------------------------------------------------
+############################################
 async def get_edit_data(video_id: int):
     step_start = time.time()
     conn = get_connection()
@@ -268,9 +226,11 @@ async def get_edit_data(video_id: int):
         "file_path": bgm[0] if bgm else None,
         "volume": float(bgm[1]) if bgm else 1.0
     }
+    # tts_tracks 쿼리 수정: transcripts의 text 컬럼(원본 한글 대사)을 추가로 선택합니다.
     curs.execute(
         """
-        SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration, tr.text, ts.speaker
+        SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration, 
+               tr.text as translated_text, ts.text as original_text, ts.speaker
         FROM tts t
         JOIN translations tr ON t.translation_id = tr.translation_id
         JOIN transcripts ts ON tr.transcript_id = ts.transcript_id
@@ -286,17 +246,24 @@ async def get_edit_data(video_id: int):
             "start_time": float(row[3]),
             "duration": float(row[4]),
             "translated_text": row[5],
-            "speaker": row[6]
+            "original_text": row[6],
+            "speaker": row[7]
         }
         for row in curs.fetchall()
     ]
     conn.close()
     total_get_time = time.time() - step_start
-    return JSONResponse(content={"video": video_data, "background_music": background_music, "tts_tracks": tts_tracks, "get_time": total_get_time}, status_code=200)
+    return JSONResponse(content={
+        "video": video_data,
+        "background_music": background_music,
+        "tts_tracks": tts_tracks,
+        "get_time": total_get_time
+    }, status_code=200)
 
-# -----------------------------------------------------------------
+
+############################################
 # 영상 업로드 및 처리 엔드포인트
-# -----------------------------------------------------------------
+############################################
 @app.post("/upload-video")
 async def upload_video(file: UploadFile = File(...)):
     overall_start = time.time()  # 전체 처리 시작 시간 기록
@@ -355,7 +322,7 @@ async def upload_video(file: UploadFile = File(...)):
         conn.close()
         timings["db_time"] = time.time() - step_start
 
-        # STT 및 번역 처리 (화자 다이어리제이션 + Clova Speech Long Sentence STT)
+        # STT 및 번역 처리 (Clova Speech Long Sentence STT with diarization 옵션 사용)
         stt_timings = await transcribe_audio(separation_data.get("vocals_path"), video_id)
         timings.update(stt_timings)
         translation_timings = await translate_video(video_id)
