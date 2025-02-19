@@ -15,6 +15,7 @@ uvicorn app.main:app --reload --port 8000
 uvicorn app.main:app --port 8000
 uvicorn app.service_a:app --host 0.0.0.0 --port 8000
 uvicorn app.service_b:app --host 0.0.0.0 --port 8001
+uvicorn app.service_c:app --host 0.0.0.0 --port 8002
 
 설치된 pip 정리:
 pip freeze > requirements.txt
@@ -29,4 +30,5 @@ python -m venv venv
 venv\Scripts\activate
 env-service-a\Scripts\activate
 env-service-b\Scripts\activate
+env-service-c\Scripts\activate
 deactivate
