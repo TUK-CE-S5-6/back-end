@@ -437,7 +437,7 @@ async def create_voice_model(
                 shutil.rmtree(split_dir, ignore_errors=True)
         except Exception as cleanup_error:
             logging.warning(f"임시 파일 정리 실패: {cleanup_error}")
-        
+
         return JSONResponse(
             content={
                 "message": "보이스 모델 생성 완료",

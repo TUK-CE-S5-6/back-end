@@ -6,6 +6,8 @@ from elevenlabs.client import ElevenLabs
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+BASE_HOST = "host-url"
+
 app = FastAPI()
 
 # 정적 파일 제공: extracted_audio 폴더 전체 제공
@@ -50,7 +52,8 @@ async def create_sound_effect(text: str = Form(...)):
         output_path = os.path.join(SOUND_EFFECTS_FOLDER, output_filename)
         generate_sound_effect(text, output_path)
         # 상대 경로 "/extracted_audio/sound_effects/xxx.mp3"를 반환하는 대신 전체 URL 구성
-        file_url = f"http://localhost:8002/extracted_audio/sound_effects/{output_filename}"
+        file_url =f"{BASE_HOST}:8002/extracted_audio/sound_effects/{output_filename}"
         return JSONResponse(content={"message": "Sound effect generated successfully", "file_url": file_url}, status_code=200)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+

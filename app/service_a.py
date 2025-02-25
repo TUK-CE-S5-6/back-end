@@ -1,18 +1,29 @@
 import os
 import time
+import json
 import openai
 import psycopg2
 import requests
 import asyncio
+from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from moviepy.editor import VideoFileClip
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
-import json
+from moviepy.editor import (
+    VideoFileClip, 
+    AudioFileClip, 
+    CompositeVideoClip, 
+    CompositeAudioClip
+)
+
+BASE_HOST = "host-url"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
+
+API_HOST = f"{BASE_HOST}:8001"
+SPLITTER_HOST = f"{BASE_HOST}:8001"
 
 # PostgreSQL 설정 (환경에 맞게 수정)
 DB_NAME = "test"
@@ -22,7 +33,6 @@ DB_HOST = "localhost"
 DB_PORT = "5433"
 
 # Clova Speech Long Sentence API 설정
-# 실제 발급받은 Secret Key와 Invoke URL로 교체하세요.
 NAVER_CLOVA_SECRET_KEY = "clova-key"  
 NAVER_CLOVA_SPEECH_URL = "invoke-url"
 
@@ -83,7 +93,6 @@ def clova_speech_stt(file_path: str, completion="sync", language="ko-KR",
     주어진 오디오 파일(file_path)을 Clova Speech Long Sentence API를 통해 전송하여,
     인식 결과 전체 JSON을 반환합니다.
     """
-    # diarization 옵션 설정 (여기서는 최소 화자 수는 1로 고정, 최대 화자 수는 전달받은 값을 사용)
     diarization = {
         "enable": True,
         "speakerCountMin": 1,
@@ -117,16 +126,10 @@ def clova_speech_stt(file_path: str, completion="sync", language="ko-KR",
 # STT 변환 (Clova Speech Long Sentence STT 사용, 화자 인식 포함)
 ############################################
 async def transcribe_audio(audio_path: str, video_id: int):
-    """
-    추출된 오디오 파일을 Clova Speech Long Sentence API에 업로드하여 STT를 수행하고,
-    API가 반환한 diarization 결과(세그먼트)를 DB에 저장합니다.
-    최소 화자 수는 1로 고정하고, 최대 화자 수는 내부 기본값(예: 2)으로 사용합니다.
-    """
     step_start = time.time()
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"STT 변환 실패: {audio_path} 파일이 존재하지 않습니다.")
     
-    # 내부 기본 최대 화자 수를 2로 설정
     result = clova_speech_stt(
         audio_path,
         completion="sync",
@@ -143,7 +146,6 @@ async def transcribe_audio(audio_path: str, video_id: int):
     curs = conn.cursor()
     if "segments" in result:
         for seg in result["segments"]:
-            # Clova API의 세그먼트 시간은 밀리초 단위이므로 초 단위로 변환
             start_sec = seg.get("start", 0) / 1000.0
             end_sec = seg.get("end", 0) / 1000.0
             text = seg.get("text", "")
@@ -226,7 +228,6 @@ async def get_edit_data(video_id: int):
         "file_path": bgm[0] if bgm else None,
         "volume": float(bgm[1]) if bgm else 1.0
     }
-    # tts_tracks 쿼리 수정: transcripts의 text 컬럼(원본 한글 대사)을 추가로 선택합니다.
     curs.execute(
         """
         SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration, 
@@ -259,7 +260,6 @@ async def get_edit_data(video_id: int):
         "tts_tracks": tts_tracks,
         "get_time": total_get_time
     }, status_code=200)
-
 
 ############################################
 # 영상 업로드 및 처리 엔드포인트
@@ -296,7 +296,7 @@ async def upload_video(file: UploadFile = File(...)):
         step_start = time.time()
         with open(extracted_audio_path, "rb") as audio_file:
             separation_response = requests.post(
-                "http://localhost:8001/separate-audio",
+                f"{SPLITTER_HOST}/separate-audio",
                 files={"file": audio_file}
             )
         if separation_response.status_code != 200:
@@ -331,7 +331,7 @@ async def upload_video(file: UploadFile = File(...)):
         # TTS 생성
         step_start = time.time()
         stt_data = {"video_id": video_id}
-        tts_response = requests.post("http://localhost:8001/generate-tts-from-stt", json=stt_data)
+        tts_response = requests.post(f"{API_HOST}/generate-tts-from-stt", json=stt_data)
         if tts_response.status_code != 200:
             raise HTTPException(status_code=500, detail="TTS 생성 서비스 호출 실패")
         timings["tts_time"] = time.time() - step_start
@@ -361,3 +361,81 @@ async def upload_video(file: UploadFile = File(...)):
         return JSONResponse(content=result_data, status_code=200)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"업로드 실패: {str(e)}")
+
+################################################################################
+# ▶ /merge-media 엔드포인트
+#    클라이언트가 WAV 파일과 여러 개의 비디오 파일 및 각 파일의 시작 시간 정보를 보내면,
+#    서버에서 CompositeVideoClip/CompositeAudioClip을 이용해 최종 영상을 생성하여 반환합니다.
+################################################################################
+@app.post("/merge-media")
+async def merge_media(
+    video: List[UploadFile] = File(...),
+    start_times: str = Form(...),
+    red_track_indices: str = Form(...),
+    audio: UploadFile = File(...)
+):
+    try:
+        try:
+            start_times_list = json.loads(start_times)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"start_times 파싱 실패: {str(e)}")
+
+        try:
+            red_indices = json.loads(red_track_indices)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"red_track_indices 파싱 실패: {str(e)}")
+
+        if len(start_times_list) != len(video) or len(red_indices) != len(video):
+            raise HTTPException(
+                status_code=400,
+                detail="비디오 파일 수와 start_times, red_track_indices 배열의 길이가 일치해야 합니다."
+            )
+
+        temp_folder = "temp"
+        os.makedirs(temp_folder, exist_ok=True)
+
+        video_clips_with_index = []
+        for idx, vid in enumerate(video):
+            video_temp_path = os.path.join(temp_folder, f"video_{int(time.time())}_{vid.filename}")
+            with open(video_temp_path, "wb") as vf:
+                vf.write(await vid.read())
+            clip = VideoFileClip(video_temp_path)
+            clip = clip.set_position((0, 0)).set_start(start_times_list[idx])
+            if clip.audio:
+                clip.audio = clip.audio.set_start(start_times_list[idx])
+            video_clips_with_index.append({
+                "clip": clip,
+                "redIndex": red_indices[idx]
+            })
+
+        if not video_clips_with_index:
+            raise HTTPException(status_code=400, detail="비디오 파일이 없습니다.")
+
+        video_clips_with_index.sort(key=lambda x: x["redIndex"])
+        video_clips_with_index.reverse()
+        sorted_clips = [item["clip"] for item in video_clips_with_index]
+
+        audio_temp_path = os.path.join(temp_folder, f"audio_{int(time.time())}_{audio.filename}")
+        with open(audio_temp_path, "wb") as af:
+            af.write(await audio.read())
+        external_audio = AudioFileClip(audio_temp_path)
+
+        composite_video = CompositeVideoClip(sorted_clips, size=sorted_clips[0].size)
+        video_audio_clips = [clip.audio for clip in sorted_clips if clip.audio is not None]
+        audio_list = video_audio_clips[:]
+        audio_list.append(external_audio)
+        if len(audio_list) > 0:
+            composite_audio = CompositeAudioClip(audio_list)
+            composite_video.audio = composite_audio
+
+        output_path = os.path.join(temp_folder, f"merged_{int(time.time())}.mp4")
+        composite_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
+
+        composite_video.close()
+        for item in video_clips_with_index:
+            item["clip"].close()
+        external_audio.close()
+
+        return FileResponse(path=output_path, filename="merged_output.mp4", media_type="video/mp4")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Merging failed: {str(e)}")     

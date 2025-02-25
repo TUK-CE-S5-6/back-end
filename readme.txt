@@ -20,7 +20,7 @@ uvicorn app.service_c:app --host 0.0.0.0 --port 8002
 설치된 pip 정리:
 pip freeze > requirements.txt
 가상환경 pip 설치:
-pip install -r requirements.txt
+pip install -r requirements_service_a.txt
 
 깃 commit 되돌리기:
 git reset --soft HEAD~1
