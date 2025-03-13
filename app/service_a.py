@@ -20,7 +20,7 @@ from moviepy.editor import (
     CompositeAudioClip
 )
 
-BASE_HOST = "host-url"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
+BASE_HOST = "localhodst"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
 
 API_HOST = f"{BASE_HOST}:8001"
 SPLITTER_HOST = f"{BASE_HOST}:8001"
@@ -124,8 +124,9 @@ def clova_speech_stt(file_path: str, completion="sync", language="ko-KR",
 
 ############################################
 # STT 변환 (Clova Speech Long Sentence STT 사용, 화자 인식 포함)
+# 이제 클라이언트가 전달한 source_language 값을 사용합니다.
 ############################################
-async def transcribe_audio(audio_path: str, video_id: int):
+async def transcribe_audio(audio_path: str, video_id: int, source_language: str):
     step_start = time.time()
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"STT 변환 실패: {audio_path} 파일이 존재하지 않습니다.")
@@ -133,7 +134,7 @@ async def transcribe_audio(audio_path: str, video_id: int):
     result = clova_speech_stt(
         audio_path,
         completion="sync",
-        language="ko-KR",
+        language=source_language,  # 클라이언트가 보낸 언어 코드 사용 (예: "ko-KR", "en-US", "ja", 등)
         wordAlignment=True,
         fullText=True,
         speakerCountMin=1,
@@ -156,7 +157,7 @@ async def transcribe_audio(audio_path: str, video_id: int):
                 INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
                 VALUES (%s, %s, %s, %s, %s, %s);
                 """,
-                (video_id, "ko", text, start_sec, end_sec, speaker)
+                (video_id, source_language, text, start_sec, end_sec, speaker)
             )
     else:
         curs.execute(
@@ -164,7 +165,7 @@ async def transcribe_audio(audio_path: str, video_id: int):
             INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
             VALUES (%s, %s, %s, %s, %s, %s);
             """,
-            (video_id, "ko", result.get("text", ""), 0, 0, "")
+            (video_id, source_language, result.get("text", ""), 0, 0, "")
         )
     conn.commit()
     curs.close()
@@ -175,8 +176,9 @@ async def transcribe_audio(audio_path: str, video_id: int):
 
 ############################################
 # 번역 및 DB 저장
+# 클라이언트가 전달한 source_language와 target_language(모두 언어 코드)를 사용합니다.
 ############################################
-async def translate_video(video_id: int):
+async def translate_video(video_id: int, source_language: str, target_language: str):
     step_start = time.time()
     conn = get_connection()
     curs = conn.cursor()
@@ -188,7 +190,7 @@ async def translate_video(video_id: int):
         response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "Translate the following Korean text into English."},
+                {"role": "system", "content": f"Translate the following text from {source_language} to {target_language}. Please ensure that your translation closely matches the original text in length and style. Aim to preserve a similar word count and sentence structure, without significantly expanding or shortening the content."},
                 {"role": "user", "content": text}
             ]
         )
@@ -198,7 +200,7 @@ async def translate_video(video_id: int):
             INSERT INTO translations (transcript_id, language, text)
             VALUES (%s, %s, %s);
             """,
-            (transcript_id, "en", translated_text)
+            (transcript_id, target_language, translated_text)
         )
     conn.commit()
     curs.close()
@@ -263,9 +265,14 @@ async def get_edit_data(video_id: int):
 
 ############################################
 # 영상 업로드 및 처리 엔드포인트
+# 클라이언트는 영상 파일과 함께 source_language, target_language(언어 코드)를 폼 데이터로 전달합니다.
 ############################################
 @app.post("/upload-video")
-async def upload_video(file: UploadFile = File(...)):
+async def upload_video(
+    file: UploadFile = File(...),
+    source_language: str = Form("ko-KR"),  # 예: "ko-KR", "en-US", "ja" 등
+    target_language: str = Form("en-US")     # 예: "en-US", "ja", 등
+):
     overall_start = time.time()  # 전체 처리 시작 시간 기록
     timings = {}
 
@@ -322,10 +329,11 @@ async def upload_video(file: UploadFile = File(...)):
         conn.close()
         timings["db_time"] = time.time() - step_start
 
-        # STT 및 번역 처리 (Clova Speech Long Sentence STT with diarization 옵션 사용)
-        stt_timings = await transcribe_audio(separation_data.get("vocals_path"), video_id)
+        # STT 처리 (source_language를 사용)
+        stt_timings = await transcribe_audio(separation_data.get("vocals_path"), video_id, source_language)
         timings.update(stt_timings)
-        translation_timings = await translate_video(video_id)
+        # 번역 처리 (source_language와 target_language 사용)
+        translation_timings = await translate_video(video_id, source_language, target_language)
         timings.update(translation_timings)
 
         # TTS 생성
@@ -438,4 +446,4 @@ async def merge_media(
 
         return FileResponse(path=output_path, filename="merged_output.mp4", media_type="video/mp4")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Merging failed: {str(e)}")     
+        raise HTTPException(status_code=500, detail=f"Merging failed: {str(e)}")
