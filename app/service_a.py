@@ -5,8 +5,9 @@ import openai
 import psycopg2
 import requests
 import asyncio
+import shutil
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -20,7 +21,7 @@ from moviepy.editor import (
     CompositeAudioClip
 )
 
-BASE_HOST = "localhodst"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
+BASE_HOST = "http://localhost"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
 
 API_HOST = f"{BASE_HOST}:8001"
 SPLITTER_HOST = f"{BASE_HOST}:8001"
@@ -190,7 +191,7 @@ async def translate_video(video_id: int, source_language: str, target_language: 
         response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": f"Translate the following text from {source_language} to {target_language}. Please ensure that your translation closely matches the original text in length and style. Aim to preserve a similar word count and sentence structure, without significantly expanding or shortening the content."},
+                {"role": "system", "content": f"Translate the following text from {source_language} to {target_language} concisely while ensuring that the translated text's length is as close as possible to the original. Maintain nearly identical word count and sentence structure so that when converted to TTS, the output closely matches the original timing."},
                 {"role": "user", "content": text}
             ]
         )
@@ -270,10 +271,10 @@ async def get_edit_data(video_id: int):
 @app.post("/upload-video")
 async def upload_video(
     file: UploadFile = File(...),
-    source_language: str = Form("ko-KR"),  # 예: "ko-KR", "en-US", "ja" 등
-    target_language: str = Form("en-US")     # 예: "en-US", "ja", 등
+    source_language: str = Form("ko-KR"),
+    target_language: str = Form("en-US")
 ):
-    overall_start = time.time()  # 전체 처리 시작 시간 기록
+    overall_start = time.time()
     timings = {}
 
     try:
@@ -281,14 +282,14 @@ async def upload_video(
         file_name = os.path.splitext(original_file_name)[0]
         base_name = file_name[:-len("_audio")] if file_name.endswith("_audio") else file_name
 
-        # 영상 파일 저장
+        # 1. 영상 파일 저장
         step_start = time.time()
         file_path = os.path.join(UPLOAD_FOLDER, file.filename)
         with open(file_path, "wb") as f:
             f.write(await file.read())
         timings["upload_time"] = time.time() - step_start
 
-        # 영상 길이 계산 및 오디오 추출
+        # 2. 영상 길이 계산 및 오디오 추출
         step_start = time.time()
         video_clip = VideoFileClip(file_path)
         duration = video_clip.duration
@@ -299,7 +300,7 @@ async def upload_video(
         video_clip.close()
         timings["audio_extraction_time"] = time.time() - step_start
 
-        # Spleeter 호출
+        # 3. Spleeter 호출
         step_start = time.time()
         with open(extracted_audio_path, "rb") as audio_file:
             separation_response = requests.post(
@@ -311,7 +312,7 @@ async def upload_video(
         separation_data = separation_response.json()
         timings["spleeter_time"] = time.time() - step_start
 
-        # DB에 비디오 정보 저장
+        # 4. DB에 비디오 정보 저장
         step_start = time.time()
         conn = get_connection()
         curs = conn.cursor()
@@ -329,14 +330,15 @@ async def upload_video(
         conn.close()
         timings["db_time"] = time.time() - step_start
 
-        # STT 처리 (source_language를 사용)
+        # 5. STT 처리
         stt_timings = await transcribe_audio(separation_data.get("vocals_path"), video_id, source_language)
         timings.update(stt_timings)
-        # 번역 처리 (source_language와 target_language 사용)
+
+        # 6. 번역 처리
         translation_timings = await translate_video(video_id, source_language, target_language)
         timings.update(translation_timings)
 
-        # TTS 생성
+        # 7. TTS 생성
         step_start = time.time()
         stt_data = {"video_id": video_id}
         tts_response = requests.post(f"{API_HOST}/generate-tts-from-stt", json=stt_data)
@@ -344,16 +346,46 @@ async def upload_video(
             raise HTTPException(status_code=500, detail="TTS 생성 서비스 호출 실패")
         timings["tts_time"] = time.time() - step_start
 
-        # 최종 결과 조회
-        step_start = time.time()
+        # 8. 최종 결과 조회
         result_response = await get_edit_data(video_id)
-        get_time = time.time() - step_start
-
-        overall_time = time.time() - overall_start
-
         result_data = result_response.body if hasattr(result_response, "body") else {}
         if isinstance(result_data, bytes):
             result_data = json.loads(result_response.body.decode())
+
+        # 9. 최종 결과물 생성: 원본 영상의 소리는 제거하고, 배경음과 TTS 트랙을 합성
+        # 배경음은 DB에 저장된 background_music의 파일 경로 사용
+        bgm_path = result_data.get("background_music", {}).get("file_path")
+        if not bgm_path:
+            raise HTTPException(status_code=500, detail="배경음 파일을 찾을 수 없습니다.")
+        background_audio = AudioFileClip(bgm_path)
+        
+        # TTS 트랙 합성 (각 TTS 클립은 start_time에 맞게 배치)
+        tts_audio_clips = []
+        for tts in result_data.get("tts_tracks", []):
+            clip = AudioFileClip(tts["file_path"]).set_start(tts["start_time"])
+            tts_audio_clips.append(clip)
+        composite_tts_audio = CompositeAudioClip(tts_audio_clips) if tts_audio_clips else None
+
+        # 최종 합성: 원본 영상의 소리는 제거하고, 배경음과 TTS 음성만 사용
+        video_clip = VideoFileClip(file_path)
+        audio_clips_to_composite = []
+        audio_clips_to_composite.append(background_audio)
+        if composite_tts_audio:
+            audio_clips_to_composite.append(composite_tts_audio)
+        final_audio = CompositeAudioClip(audio_clips_to_composite)
+        video_clip.audio = final_audio
+
+        merged_filename = f"merged_{int(time.time())}.mp4"
+        merged_output_path = os.path.join(UPLOAD_FOLDER, merged_filename)
+        video_clip.write_videofile(merged_output_path, codec="libx264", audio_codec="aac")
+        video_clip.close()
+        background_audio.close()
+        if composite_tts_audio:
+            composite_tts_audio.close()
+        timings["merge_time"] = time.time() - stt_timings.get("stt_time", 0)  # 예시
+
+        overall_time = time.time() - overall_start
+
         result_data["timings"] = {
             "upload_time": timings.get("upload_time", 0),
             "audio_extraction_time": timings.get("audio_extraction_time", 0),
@@ -362,18 +394,18 @@ async def upload_video(
             "stt_time": timings.get("stt_time", 0),
             "translation_time": timings.get("translation_time", 0),
             "tts_time": timings.get("tts_time", 0),
-            "get_time": get_time,
+            "merge_time": timings.get("merge_time", 0),
             "overall_time": overall_time
         }
+        result_data["merged_media_url"] = f"http://{BASE_HOST}:8000/videos/{merged_filename}"
 
         return JSONResponse(content=result_data, status_code=200)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"업로드 실패: {str(e)}")
 
+
 ################################################################################
-# ▶ /merge-media 엔드포인트
-#    클라이언트가 WAV 파일과 여러 개의 비디오 파일 및 각 파일의 시작 시간 정보를 보내면,
-#    서버에서 CompositeVideoClip/CompositeAudioClip을 이용해 최종 영상을 생성하여 반환합니다.
+# ▶ /merge-media 엔드포인트 (별도 호출 시)
 ################################################################################
 @app.post("/merge-media")
 async def merge_media(
@@ -447,3 +479,233 @@ async def merge_media(
         return FileResponse(path=output_path, filename="merged_output.mp4", media_type="video/mp4")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Merging failed: {str(e)}")
+    
+    
+@app.post("/translate-text")
+async def translate_text_endpoint(
+    text: str = Form(...),
+    source_language: str = Form(...),
+    target_language: str = Form(...)
+):
+    ALLOWED_TARGET_LANGUAGES = {"ko-KR", "en-US", "enko", "ja", "zh-cn", "zh-tw"}
+    # 대상 언어 확인
+    if target_language not in ALLOWED_TARGET_LANGUAGES:
+        raise HTTPException(status_code=400, detail="지원되지 않는 대상 언어입니다.")
+
+    try:
+        # 번역 프롬프트: 원본 텍스트와 최대한 길이가 유사하게 번역
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": (
+                        f"Translate the following text from {source_language} to {target_language} in a concise manner "
+                        "while keeping the translation as close in length as possible to the original. "
+                        "Maintain nearly identical word count and sentence structure so that the final TTS output "
+                        "closely matches the original timing."
+                    )
+                },
+                {"role": "user", "content": text}
+            ]
+        )
+        translated_text = response["choices"][0]["message"]["content"].strip()
+        return JSONResponse(content={"translated_text": translated_text}, status_code=200)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# ----------------------------
+# 파일 관리 엔드포인트 추가
+# ----------------------------
+
+@app.get("/list-file")
+async def list_file():
+    try:
+        # uploaded_videos 폴더 내 파일 목록 (파일만)
+        uploaded_videos_dir = "uploaded_videos"
+        uploaded_files = [
+            f for f in os.listdir(uploaded_videos_dir)
+            if os.path.isfile(os.path.join(uploaded_videos_dir, f))
+        ]
+
+        # extracted_audio 폴더 내 특정 하위 폴더 목록
+        extracted_audio_dir = "extracted_audio"
+        subfolders = ["sound_effects", "custom_tts"]
+        extracted_audio_structure = {}
+        for folder in subfolders:
+            folder_path = os.path.join(extracted_audio_dir, folder)
+            if os.path.exists(folder_path) and os.path.isdir(folder_path):
+                files = os.listdir(folder_path)
+                # 파일만 반환
+                file_list = [f for f in files if os.path.isfile(os.path.join(folder_path, f))]
+                extracted_audio_structure[folder] = file_list
+            else:
+                extracted_audio_structure[folder] = []
+        
+        return JSONResponse(
+            content={
+                "uploaded_videos": uploaded_files,
+                "extracted_audio": extracted_audio_structure
+            },
+            status_code=200
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/file-details")
+async def file_details(filename: str = Query(..., description="업로드된 비디오 파일명 (예: example.mp4)")):
+    try:
+        # DB에서 해당 영상 정보 조회 (file_name이 정확히 일치하는 레코드)
+        conn = get_connection()
+        curs = conn.cursor()
+        curs.execute(
+            "SELECT video_id, file_name, file_path, duration FROM videos WHERE file_name = %s ORDER BY video_id DESC LIMIT 1;",
+            (filename,)
+        )
+        video = curs.fetchone()
+        if not video:
+            raise HTTPException(status_code=404, detail="해당 영상 정보를 찾을 수 없습니다.")
+        
+        video_id = video[0]
+        base_name = os.path.splitext(video[1])[0]  # 예: "example" (확장자 제거)
+
+        # URL 구성 (정적 파일 제공 경로에 맞게)
+        video_url = f"{BASE_HOST}:8000/videos/{video[1]}"
+        extracted_audio_filename = f"{base_name}.mp3"
+        extracted_audio_url = f"{BASE_HOST}:8000/extracted_audio/{extracted_audio_filename}"
+
+        # Spleeter 결과 폴더 내의 vocal.wav와 accompaniment.wav
+        vocal_path = os.path.join("extracted_audio", base_name, "vocals.wav")
+        accompaniment_path = os.path.join("extracted_audio", base_name, "accompaniment.wav")
+        vocal_url = f"{BASE_HOST}:8000/extracted_audio/{base_name}/vocals.wav" if os.path.exists(vocal_path) else None
+        accompaniment_url = f"{BASE_HOST}:8000/extracted_audio/{base_name}/accompaniment.wav" if os.path.exists(accompaniment_path) else None
+
+        # DB에서 TTS 트랙 정보 조회 (영상과 연결된 tts 레코드)
+        curs.execute(
+            """
+            SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration, 
+                   tr.text AS translated_text, ts.text AS original_text, ts.speaker
+            FROM tts t
+            JOIN translations tr ON t.translation_id = tr.translation_id
+            JOIN transcripts ts ON tr.transcript_id = ts.transcript_id
+            WHERE ts.video_id = %s;
+            """,
+            (video_id,)
+        )
+        tts_rows = curs.fetchall()
+        tts_tracks = []
+        for row in tts_rows:
+            # DB에 저장된 전체 상대경로를 그대로 사용하여 URL 구성
+            tts_url = f"{BASE_HOST}:8000/{row[1]}"
+            tts_tracks.append({
+                "tts_id": row[0],
+                "file_url": tts_url,
+                "voice": row[2],
+                "start_time": row[3],
+                "duration": row[4],
+                "translated_text": row[5],
+                "original_text": row[6],
+                "speaker": row[7]
+            })
+        curs.close()
+        conn.close()
+
+        return JSONResponse(content={
+            "video": {
+                "file_name": video[1],
+                "url": video_url,
+                "duration": float(video[3])
+            },
+            "extracted_audio": {
+                "file_name": extracted_audio_filename,
+                "url": extracted_audio_url
+            },
+            "spleeter": {
+                "vocal": vocal_url,
+                "accompaniment": accompaniment_url
+            },
+            "tts_tracks": tts_tracks
+        }, status_code=200)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/delete-video")
+async def delete_video(filename: str = Query(..., description="삭제할 영상 파일명")):
+    # DB에서 해당 영상 조회
+    conn = get_connection()
+    curs = conn.cursor()
+    curs.execute(
+            "SELECT video_id, file_name, file_path, duration FROM videos WHERE file_name = %s ORDER BY video_id DESC LIMIT 1;",
+            (filename,)
+        )
+    video = curs.fetchone()
+    if not video:
+        raise HTTPException(status_code=404, detail="해당 영상이 존재하지 않습니다.")
+    video_id, video_path = video
+    base_name = os.path.splitext(filename)[0]
+
+    # 파일 시스템에서 영상 파일 삭제
+    if os.path.exists(video_path):
+        os.remove(video_path)
+
+    # 추출된 오디오 파일 삭제
+    extracted_audio_path = os.path.join("extracted_audio", f"{base_name}.mp3")
+    if os.path.exists(extracted_audio_path):
+        os.remove(extracted_audio_path)
+
+    # Spleeter 결과 폴더 삭제 (예: extracted_audio/{base_name})
+    spleeter_folder = os.path.join("extracted_audio", base_name)
+    if os.path.exists(spleeter_folder):
+        shutil.rmtree(spleeter_folder)
+
+    # 관련 DB 레코드 삭제 (예: transcripts, translations, TTS, background_music, videos)
+    try:
+        # TTS 삭제: transcripts와 연결된 translation, tts 기록 삭제
+        curs.execute("""
+            DELETE FROM tts 
+            WHERE translation_id IN (
+                SELECT translation_id FROM translations 
+                WHERE transcript_id IN (
+                    SELECT transcript_id FROM transcripts WHERE video_id = %s
+                )
+            );
+        """, (video_id,))
+        curs.execute("""
+            DELETE FROM translations 
+            WHERE transcript_id IN (
+                SELECT transcript_id FROM transcripts WHERE video_id = %s
+            );
+        """, (video_id,))
+        curs.execute("DELETE FROM transcripts WHERE video_id = %s;", (video_id,))
+        curs.execute("DELETE FROM background_music WHERE video_id = %s;", (video_id,))
+        curs.execute("DELETE FROM videos WHERE video_id = %s;", (video_id,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="DB 삭제 중 오류 발생")
+    finally:
+        curs.close()
+        conn.close()
+
+    return {"detail": "영상 및 관련 파일이 성공적으로 삭제되었습니다."}
+
+@app.delete("/delete-audio-file")
+async def delete_audio_file(
+    file: str = Query(..., description="삭제할 오디오 파일명"),
+    folder: str = Query(..., description="파일이 속한 폴더 (custom_tts 또는 sound_effects)")
+):
+    allowed_folders = ["custom_tts", "sound_effects"]
+    if folder not in allowed_folders:
+        raise HTTPException(status_code=400, detail="허용되지 않은 폴더입니다.")
+    
+    file_path = os.path.join("extracted_audio", folder, file)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    
+    try:
+        os.remove(file_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"파일 삭제 중 오류 발생: {str(e)}")
+    
+    return {"detail": f"{folder} 폴더의 {file} 파일이 삭제되었습니다."}
+ 
