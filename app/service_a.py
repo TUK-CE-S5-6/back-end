@@ -7,7 +7,7 @@ import requests
 import asyncio
 import shutil
 from typing import List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query, Response, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -35,7 +35,7 @@ DB_PORT = "5433"
 
 # Clova Speech Long Sentence API 설정
 NAVER_CLOVA_SECRET_KEY = "clova-key"  
-NAVER_CLOVA_SPEECH_URL = "invoke-url"
+NAVER_CLOVA_SPEECH_URL = "invoke-rul"
 
 # OpenAI API 설정 (번역용)
 OPENAI_API_KEY = "gpt-key"
@@ -83,6 +83,228 @@ class UserCreate(BaseModel):
 class User(BaseModel):
     user_id: int
     username: str
+
+
+############################################
+# 회원가입 엔드포인트 (토큰을 쿠키에 설정)
+############################################
+@app.post("/signup")
+async def signup(response: Response, username: str = Form(...), password: str = Form(...)):
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        # 이미 같은 username이 존재하는지 확인
+        curs.execute("SELECT user_id FROM users WHERE username = %s", (username,))
+        if curs.fetchone():
+            raise HTTPException(status_code=400, detail="Username already exists")
+        curs.execute(
+            "INSERT INTO users (username, password) VALUES (%s, %s) RETURNING user_id",
+            (username, password)
+        )
+        user_id = curs.fetchone()[0]
+        conn.commit()
+        curs.close()
+        conn.close()
+        # 예제용 토큰 생성 (실제 서비스에서는 JWT 등 안전한 방식을 사용하세요)
+        token = f"token-for-user-{user_id}"
+        res = JSONResponse(content={"message": "Signup successful", "user_id": user_id})
+        # HttpOnly 쿠키로 토큰 저장: 클라이언트 측 스크립트에서 접근할 수 없으므로 안전함
+        res.set_cookie(key="token", value=token, httponly=True, path="/")
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+############################################
+# 로그인 엔드포인트 (토큰을 쿠키에 설정)
+############################################
+@app.post("/login")
+async def login(response: Response, username: str = Form(...), password: str = Form(...)):
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        curs.execute("SELECT user_id, password FROM users WHERE username = %s", (username,))
+        result = curs.fetchone()
+        if result is None:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        user_id, stored_password = result
+        if password != stored_password:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        # 예제용 토큰. 실제 서비스에서는 JWT 등 안전한 토큰을 사용하세요.
+        token = f"token-for-user-{user_id}"
+        curs.close()
+        conn.close()
+        res = JSONResponse(content={"message": "Login successful", "user_id": user_id})
+        res.set_cookie(key="token", value=token, httponly=True, path="/")
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+############################################
+# 현재 로그인한 사용자 정보를 반환하는 엔드포인트
+############################################
+@app.get("/me")
+async def get_current_user(request: Request):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    # 예제 토큰의 경우 "token-for-user-{user_id}" 형식이므로, 이를 파싱하여 user_id를 추출
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    return {"user_id": user_id}
+
+############################################
+# 사용자별 프로젝트
+############################################
+@app.get("/projects")
+async def get_projects(request: Request):
+    # 쿠키에서 토큰 추출 (예제 토큰 형식: "token-for-user-{user_id}")
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        # 해당 user_id에 속한 프로젝트를 최신순으로 조회
+        curs.execute(
+            "SELECT project_id, project_name, description, created_at FROM projects WHERE user_id = %s ORDER BY created_at DESC",
+            (user_id,)
+        )
+        projects = curs.fetchall()
+        curs.close()
+        conn.close()
+
+        projects_list = [
+            {
+                "project_id": row[0],
+                "project_name": row[1],
+                "description": row[2],
+                # datetime 객체를 문자열로 변환 (.isoformat())
+                "created_at": row[3].isoformat() if row[3] else None
+            }
+            for row in projects
+        ]
+        return JSONResponse(content={"projects": projects_list}, status_code=200)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/projects/add")
+async def add_project(
+    request: Request,
+    project_name: str = Form(...),
+    description: str = Form("")
+):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        curs.execute(
+            "INSERT INTO projects (project_name, description, user_id) VALUES (%s, %s, %s) RETURNING project_id",
+            (project_name, description, user_id)
+        )
+        project_id = curs.fetchone()[0]
+        conn.commit()
+        curs.close()
+        conn.close()
+        return JSONResponse(
+            content={
+                "project_id": project_id,
+                "project_name": project_name,
+                "description": description
+            },
+            status_code=200
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: int, request: Request):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        # 예제 토큰 형식: "token-for-user-{user_id}"
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        # 현재 사용자 소유의 프로젝트인지 확인
+        curs.execute(
+            "SELECT project_id FROM projects WHERE project_id = %s AND user_id = %s",
+            (project_id, user_id)
+        )
+        row = curs.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없거나 삭제 권한이 없습니다.")
+        
+        # 프로젝트 삭제 (참조 무결성은 DB 설정에 따름)
+        curs.execute("DELETE FROM projects WHERE project_id = %s", (project_id,))
+        conn.commit()
+        curs.close()
+        conn.close()
+        return JSONResponse(content={"message": "프로젝트 삭제 성공"}, status_code=200)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/projects/{project_id}/videos/edit_data")
+async def get_project_videos_edit_data(project_id: int, request: Request):
+    # 쿠키에서 토큰 추출 (예제 토큰 형식: "token-for-user-{user_id}")
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        # 해당 프로젝트가 현재 로그인한 사용자의 소유인지 확인
+        curs.execute(
+            "SELECT project_id FROM projects WHERE project_id = %s AND user_id = %s",
+            (project_id, user_id)
+        )
+        if curs.fetchone() is None:
+            raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없거나 권한이 없습니다.")
+        
+        # 해당 프로젝트에 속한 모든 영상의 video_id 조회
+        curs.execute("SELECT video_id FROM videos WHERE project_id = %s", (project_id,))
+        video_ids = [row[0] for row in curs.fetchall()]
+        curs.close()
+        conn.close()
+        
+        # 각 video_id에 대해 get_edit_data를 호출하여 상세 정보 수집
+        videos_data = []
+        for vid in video_ids:
+            response = await get_edit_data(vid)
+            # get_edit_data는 JSONResponse를 반환하므로, body를 파싱합니다.
+            # body가 bytes인 경우 디코딩 후 JSON으로 변환
+            if isinstance(response.body, bytes):
+                data = json.loads(response.body.decode())
+            else:
+                data = response.body
+            videos_data.append(data)
+        
+        return JSONResponse(content={"videos": videos_data}, status_code=200)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 ############################################
 # Clova Speech Long Sentence STT 호출 함수 (Secret Key 사용)
@@ -272,7 +494,8 @@ async def get_edit_data(video_id: int):
 async def upload_video(
     file: UploadFile = File(...),
     source_language: str = Form("ko-KR"),
-    target_language: str = Form("en-US")
+    target_language: str = Form("en-US"),
+    project_id: int = Form(...),  # 클라이언트에서 선택한 프로젝트 ID를 반드시 전달
 ):
     overall_start = time.time()
     timings = {}
@@ -295,7 +518,7 @@ async def upload_video(
         duration = video_clip.duration
         extracted_audio_path = os.path.join(AUDIO_FOLDER, f"{base_name}.mp3")
         audio_clip = video_clip.audio
-        audio_clip.write_audiofile(extracted_audio_path, codec='mp3')
+        audio_clip.write_audiofile(extracted_audio_path, codec="mp3")
         audio_clip.close()
         video_clip.close()
         timings["audio_extraction_time"] = time.time() - step_start
@@ -312,13 +535,13 @@ async def upload_video(
         separation_data = separation_response.json()
         timings["spleeter_time"] = time.time() - step_start
 
-        # 4. DB에 비디오 정보 저장
+        # 4. DB에 비디오 정보 저장 (project_id 포함)
         step_start = time.time()
         conn = get_connection()
         curs = conn.cursor()
         curs.execute(
-            "INSERT INTO videos (file_name, file_path, duration) VALUES (%s, %s, %s) RETURNING video_id;",
-            (file.filename, file_path, duration)
+            "INSERT INTO videos (file_name, file_path, duration, project_id) VALUES (%s, %s, %s, %s) RETURNING video_id;",
+            (file.filename, file_path, duration, project_id)
         )
         video_id = curs.fetchone()[0]
         curs.execute(
@@ -346,30 +569,26 @@ async def upload_video(
             raise HTTPException(status_code=500, detail="TTS 생성 서비스 호출 실패")
         timings["tts_time"] = time.time() - step_start
 
-        # 8. 최종 결과 조회
+        # 8. 최종 결과 조회 및 영상 합성 (생략된 기존 처리)
         result_response = await get_edit_data(video_id)
         result_data = result_response.body if hasattr(result_response, "body") else {}
         if isinstance(result_data, bytes):
             result_data = json.loads(result_response.body.decode())
 
-        # 9. 최종 결과물 생성: 원본 영상의 소리는 제거하고, 배경음과 TTS 트랙을 합성
-        # 배경음은 DB에 저장된 background_music의 파일 경로 사용
+        # 합성 처리 (배경음, TTS 등)
         bgm_path = result_data.get("background_music", {}).get("file_path")
         if not bgm_path:
             raise HTTPException(status_code=500, detail="배경음 파일을 찾을 수 없습니다.")
         background_audio = AudioFileClip(bgm_path)
         
-        # TTS 트랙 합성 (각 TTS 클립은 start_time에 맞게 배치)
         tts_audio_clips = []
         for tts in result_data.get("tts_tracks", []):
             clip = AudioFileClip(tts["file_path"]).set_start(tts["start_time"])
             tts_audio_clips.append(clip)
         composite_tts_audio = CompositeAudioClip(tts_audio_clips) if tts_audio_clips else None
 
-        # 최종 합성: 원본 영상의 소리는 제거하고, 배경음과 TTS 음성만 사용
         video_clip = VideoFileClip(file_path)
-        audio_clips_to_composite = []
-        audio_clips_to_composite.append(background_audio)
+        audio_clips_to_composite = [background_audio]
         if composite_tts_audio:
             audio_clips_to_composite.append(composite_tts_audio)
         final_audio = CompositeAudioClip(audio_clips_to_composite)
@@ -382,7 +601,7 @@ async def upload_video(
         background_audio.close()
         if composite_tts_audio:
             composite_tts_audio.close()
-        timings["merge_time"] = time.time() - stt_timings.get("stt_time", 0)  # 예시
+        timings["merge_time"] = time.time() - stt_timings.get("stt_time", 0)
 
         overall_time = time.time() - overall_start
 
