@@ -18,8 +18,10 @@ from moviepy.editor import (
     VideoFileClip, 
     AudioFileClip, 
     CompositeVideoClip, 
-    CompositeAudioClip
+    CompositeAudioClip,
+    concatenate_videoclips
 )
+import moviepy.video.fx.all as vfx
 
 BASE_HOST = "http://localhost"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
 
@@ -35,7 +37,7 @@ DB_PORT = "5433"
 
 # Clova Speech Long Sentence API 설정
 NAVER_CLOVA_SECRET_KEY = "clova-key"  
-NAVER_CLOVA_SPEECH_URL = "invoke-rul"
+NAVER_CLOVA_SPEECH_URL = "invoke-url"
 
 # OpenAI API 설정 (번역용)
 OPENAI_API_KEY = "gpt-key"
@@ -501,11 +503,11 @@ async def upload_video(
     timings = {}
 
     try:
+        # 1. 영상 파일 저장
         original_file_name = file.filename
         file_name = os.path.splitext(original_file_name)[0]
         base_name = file_name[:-len("_audio")] if file_name.endswith("_audio") else file_name
 
-        # 1. 영상 파일 저장
         step_start = time.time()
         file_path = os.path.join(UPLOAD_FOLDER, file.filename)
         with open(file_path, "wb") as f:
@@ -569,13 +571,53 @@ async def upload_video(
             raise HTTPException(status_code=500, detail="TTS 생성 서비스 호출 실패")
         timings["tts_time"] = time.time() - step_start
 
-        # 8. 최종 결과 조회 및 영상 합성 (생략된 기존 처리)
+        # 8. 최종 결과 조회 및 영상 합성 (기존 get_edit_data 활용)
         result_response = await get_edit_data(video_id)
         result_data = result_response.body if hasattr(result_response, "body") else {}
         if isinstance(result_data, bytes):
             result_data = json.loads(result_response.body.decode())
 
-        # 합성 처리 (배경음, TTS 등)
+        # ---- 오버랩 감지 및 영상 속도 조절 시작 ----
+        tts_tracks = result_data.get("tts_tracks", [])
+        # 영상 클립 재로딩
+        video_clip = VideoFileClip(file_path)
+        if len(tts_tracks) >= 2:
+            # 정렬: start_time 기준
+            tts_tracks_sorted = sorted(tts_tracks, key=lambda x: x["start_time"])
+            cumulative_shift = 0  # 누적 시간 변경량
+            for i in range(1, len(tts_tracks_sorted)):
+                prev = tts_tracks_sorted[i-1]
+                curr = tts_tracks_sorted[i]
+                prev_end = prev["start_time"] + prev["duration"] + cumulative_shift
+                if prev_end > curr["start_time"]:
+                    # 겹치는 시간 계산
+                    overlap = prev_end - curr["start_time"]
+                    original_segment_duration = curr["start_time"] - prev["start_time"]
+                    desired_segment_duration = prev["duration"]
+                    speed_factor = original_segment_duration / desired_segment_duration
+                    new_curr_start = prev["start_time"] + desired_segment_duration
+                    shift = new_curr_start - curr["start_time"]
+                    # 로그 출력: 원래 구간, 겹침, 속도 인자, shift
+                    print(f"Overlap detected between TTS {i} and TTS {i+1}:")
+                    print(f"  Previous TTS starts at {prev['start_time']}s with duration {prev['duration']}s (ends at {prev['start_time']+prev['duration']}s)")
+                    print(f"  Current TTS original start: {curr['start_time']}s")
+                    print(f"  Calculated overlap: {overlap}s")
+                    print(f"  Original transcript segment duration: {original_segment_duration}s")
+                    print(f"  Desired segment duration (prev TTS duration): {desired_segment_duration}s")
+                    print(f"  Speed factor applied: {speed_factor}")
+                    print(f"  Shift applied to current TTS: {shift}s, new start time: {curr['start_time'] + shift}s")
+                    
+                    curr["start_time"] += shift
+                    cumulative_shift += shift
+
+                    # 영상 클립 조절: 조절 구간은 [prev.start_time, curr.start_time - shift]
+                    clip_before = video_clip.subclip(0, prev["start_time"])
+                    clip_overlap = video_clip.subclip(prev["start_time"], curr["start_time"] - shift).fx(vfx.speedx, factor=speed_factor)
+                    clip_after = video_clip.subclip(curr["start_time"] - shift, video_clip.duration)
+                    video_clip = concatenate_videoclips([clip_before, clip_overlap, clip_after])
+        # ---- 오버랩 감지 및 영상 속도 조절 끝 ----
+
+        # 9. 최종 영상 합성: 배경음 및 TTS 트랙 합성
         bgm_path = result_data.get("background_music", {}).get("file_path")
         if not bgm_path:
             raise HTTPException(status_code=500, detail="배경음 파일을 찾을 수 없습니다.")
@@ -587,7 +629,6 @@ async def upload_video(
             tts_audio_clips.append(clip)
         composite_tts_audio = CompositeAudioClip(tts_audio_clips) if tts_audio_clips else None
 
-        video_clip = VideoFileClip(file_path)
         audio_clips_to_composite = [background_audio]
         if composite_tts_audio:
             audio_clips_to_composite.append(composite_tts_audio)

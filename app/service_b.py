@@ -264,7 +264,7 @@ def adjust_tts_duration(file_path: str, desired_duration: float) -> float:
     y, sr = librosa.load(file_path, sr=None)
     current_duration = librosa.get_duration(y=y, sr=sr)
     rate = current_duration / desired_duration
-    rate = min(max(rate, 0.85), 1.15)
+    rate = min(max(rate, 0.9), 1.1)
     logging.info(
         f"adjust_tts_duration - 현재 길이: {current_duration:.2f} sec, "
         f"원하는 길이: {desired_duration:.2f} sec, 적용 비율: {rate:.2f}"
