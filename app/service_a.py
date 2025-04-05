@@ -77,6 +77,10 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 AUDIO_FOLDER = "extracted_audio"
 os.makedirs(AUDIO_FOLDER, exist_ok=True)
 
+# 사용자별 파일 관리를 위한 폴더 경로 설정
+USER_FILES_FOLDER = "user_files"
+os.makedirs(USER_FILES_FOLDER, exist_ok=True)
+
 # Pydantic 모델 (사용자 관련 예시)
 class UserCreate(BaseModel):
     username: str
@@ -307,6 +311,81 @@ async def get_project_videos_edit_data(project_id: int, request: Request):
         return JSONResponse(content={"videos": videos_data}, status_code=200)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# 1. 사용자별 파일 업로드 엔드포인트
+@app.post("/upload-file")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    # 사용자 전용 폴더 생성 (예: user_files/3)
+    user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
+    os.makedirs(user_folder, exist_ok=True)
+    file_path = os.path.join(user_folder, file.filename)
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+    return JSONResponse(content={"message": "파일 업로드 성공", "file_path": file_path}, status_code=200)
+
+
+# 2. 사용자별 파일 목록 조회 엔드포인트
+@app.get("/user-files")
+async def list_user_files(request: Request):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
+    if not os.path.exists(user_folder):
+        return JSONResponse(content={"files": []}, status_code=200)
+    files = [f for f in os.listdir(user_folder) if os.path.isfile(os.path.join(user_folder, f))]
+    return JSONResponse(content={"files": files}, status_code=200)
+
+# 3. 사용자별 파일 삭제 엔드포인트
+@app.delete("/user-files")
+async def delete_user_file(request: Request, file: str = Query(..., description="삭제할 파일명") ):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+    user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
+    file_path = os.path.join(user_folder, file)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    try:
+        os.remove(file_path)
+        return JSONResponse(content={"message": "파일 삭제 성공"}, status_code=200)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"파일 삭제 실패: {str(e)}")
+
+# 3. 사용자별 파일 다운로드 엔드포인트
+@app.get("/download-file")
+async def download_file(request: Request, file_name: str = Query(...)):
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        user_id = int(token.split("-")[-1])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+
+    # 사용자 전용 폴더
+    user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
+    file_path = os.path.join(user_folder, file_name)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="파일이 존재하지 않습니다.")
+
+    return FileResponse(file_path, filename=file_name, media_type="application/octet-stream")
 
 ############################################
 # Clova Speech Long Sentence STT 호출 함수 (Secret Key 사용)
