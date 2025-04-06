@@ -312,6 +312,27 @@ async def get_project_videos_edit_data(project_id: int, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def detect_file_type(file_name):
+    ext = os.path.splitext(file_name)[1].lower()
+    if ext in [".mp3", ".wav", ".aac"]:
+        return "audio"
+    elif ext in [".mp4", ".mov", ".avi", ".webm"]:
+        return "video"
+    elif ext in [".jpg", ".jpeg", ".png", ".gif"]:
+        return "image"
+    else:
+        return "other"
+
+def get_duration(file_path, file_type):
+    try:
+        if file_type == "audio":
+            return AudioFileClip(file_path).duration
+        elif file_type == "video":
+            return VideoFileClip(file_path).duration
+    except:
+        return None
+    return None
+
 # 1. 사용자별 파일 업로드 엔드포인트
 @app.post("/upload-file")
 async def upload_file(request: Request, file: UploadFile = File(...)):
@@ -341,11 +362,26 @@ async def list_user_files(request: Request):
         user_id = int(token.split("-")[-1])
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token format")
+
     user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
     if not os.path.exists(user_folder):
         return JSONResponse(content={"files": []}, status_code=200)
-    files = [f for f in os.listdir(user_folder) if os.path.isfile(os.path.join(user_folder, f))]
-    return JSONResponse(content={"files": files}, status_code=200)
+
+    files_info = []
+    for file_name in os.listdir(user_folder):
+        file_path = os.path.join(user_folder, file_name)
+        if os.path.isfile(file_path):
+            file_type = detect_file_type(file_name)
+            duration = get_duration(file_path, file_type)
+            file_url = f"{BASE_HOST}:8000/user_files/{user_id}/{file_name}"
+            files_info.append({
+                "file_name": file_name,
+                "file_url": file_url,
+                "file_type": file_type,
+                "duration": duration
+            })
+
+    return JSONResponse(content={"files": files_info}, status_code=200)
 
 # 3. 사용자별 파일 삭제 엔드포인트
 @app.delete("/user-files")
@@ -367,7 +403,7 @@ async def delete_user_file(request: Request, file: str = Query(..., description=
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"파일 삭제 실패: {str(e)}")
 
-# 3. 사용자별 파일 다운로드 엔드포인트
+# 4. 사용자별 파일 다운로드 엔드포인트
 @app.get("/download-file")
 async def download_file(request: Request, file_name: str = Query(...)):
     token = request.cookies.get("token")
