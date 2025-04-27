@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 
+
 # ----------------------------
 # 기본 설정 및 환경 변수
 # ----------------------------
@@ -31,6 +32,8 @@ CUSTOM_TTS_FOLDER = os.path.join(AUDIO_FOLDER, "custom_tts")
 os.makedirs(CUSTOM_TTS_FOLDER, exist_ok=True)
 VOICE_MODEL_FOLDER = "voice_models"
 os.makedirs(VOICE_MODEL_FOLDER, exist_ok=True)
+USER_FILES_FOLDER = "user_files"
+os.makedirs(USER_FILES_FOLDER, exist_ok=True)
 
 # FastAPI 앱 생성
 app = FastAPI()
@@ -45,10 +48,9 @@ ELEVENLABS_API_KEY = "eleven-key"
 ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1"
 
 # CORS 설정
-origins = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -320,238 +322,205 @@ async def separate_audio(file: UploadFile = File(...)):
         raise HTTPException(
             status_code=500, detail=f"Spleeter 처리 실패: {str(e)}"
         )
+        
+def stretch_audio(input_path: str, output_path: str, current_duration: float, desired_duration: float) -> float:
+    """
+    pydub을 사용해 파일 속도를 조절.
+    Returns: 새로 조정된 길이 (초)
+    """
+    speed = current_duration / desired_duration
+    logging.debug(f"→ Applying speed change: {speed:.4f}×")
+
+    sound = AudioSegment.from_file(input_path)
+    new_frame_rate = int(sound.frame_rate * speed)
+    stretched = sound._spawn(sound.raw_data, overrides={"frame_rate": new_frame_rate})
+    stretched = stretched.set_frame_rate(sound.frame_rate)
+    ensure_folder(os.path.dirname(output_path))
+    stretched.export(output_path, format="mp3", bitrate="192k")
+
+    new_duration = len(stretched) / 1000.0
+    logging.debug(f"→ New duration: {new_duration:.3f}s")
+    return new_duration
 
 @app.post("/generate-tts-from-stt")
 async def generate_tts_from_stt(data: dict):
+    """
+    - video_id로 DB에서 번역·트랜스크립트 조회
+    - ElevenLabs TTS 생성
+    - 필요 시 pydub 기반 stretch_audio로 길이 보정
+    - tts 테이블에 삽입
+    """
     try:
         video_id = data.get("video_id")
-        if video_id is None:
-            raise HTTPException(status_code=400, detail="video_id가 필요합니다.")
+        if not video_id:
+            raise HTTPException(400, "video_id가 필요합니다.")
+
+        speaker_voice_map = {
+            "A": "29vD33N1CtxCmqQRPOHJ",
+            "B": "21m00Tcm4TlvDq8ikWAM",
+            "C": "5Q0t7uMcjvnagumLfvZi",
+        }
+        default_voice_id = "5Af3x6nAIWjF6agOOtOz"
+        avg_chars_per_second = 15
+
         with get_db_cursor() as curs:
             curs.execute(
                 """
-                SELECT t.translation_id, t.text, tr.start_time, tr.end_time
+                SELECT t.translation_id, t.text, tr.start_time, tr.end_time, tr.speaker
                 FROM translations t
-                JOIN transcripts tr ON t.transcript_id = tr.transcript_id
+                JOIN transcripts tr USING(transcript_id)
                 WHERE tr.video_id = %s;
                 """,
                 (video_id,)
             )
-            translations = curs.fetchall()
-            if not translations:
-                raise HTTPException(
-                    status_code=404, detail="번역된 데이터가 없습니다."
-                )
-            tts_output_dir = os.path.join(AUDIO_FOLDER, f"{video_id}_tts")
-            ensure_folder(tts_output_dir)
-            selected_voice_id = "5Af3x6nAIWjF6agOOtOz"
-            for translation_id, text, start_time, end_time in translations:
-                try:
-                    url = (
-                        f"{ELEVENLABS_BASE_URL}/text-to-speech/"
-                        f"{selected_voice_id}?output_format=mp3_44100_128"
-                    )
-                    headers = {
-                        "xi-api-key": ELEVENLABS_API_KEY,
-                        "Content-Type": "application/json",
-                    }
-                    payload = {
-                        "text": text,
-                        "model_id": "eleven_multilingual_v2",
-                    }
-                    response = requests.post(url, headers=headers, json=payload)
-                    if response.status_code != 200:
-                        raise Exception(
-                            f"ElevenLabs TTS 생성 실패: {response.text}"
-                        )
-                    audio_content = response.content
+            rows = curs.fetchall()
+            if not rows:
+                raise HTTPException(404, "번역 데이터가 없습니다.")
 
-                    tts_audio_path = os.path.join(
-                        tts_output_dir, f"{translation_id}.mp3"
-                    )
-                    with open(tts_audio_path, "wb") as tts_file:
-                        tts_file.write(audio_content)
+            tts_dir = os.path.join(AUDIO_FOLDER, f"{video_id}_tts")
+            ensure_folder(tts_dir)
 
-                    current_duration = librosa.get_duration(path=tts_audio_path)
-                    desired_duration = float(end_time) - float(start_time)
+            for translation_id, text, start_time, end_time, speaker in rows:
+                voice_id = speaker_voice_map.get(speaker, default_voice_id)
+                desired = float(end_time) - float(start_time)
+                if desired <= 0:
+                    logging.warning(f"잘못된 시간: {start_time}~{end_time} (id={translation_id})")
+                    continue
 
-                    # 로그 추가: TTS 텍스트, 원본 길이, 원하는 길이 출력
-                    logging.info(f"TTS 텍스트: {text}")
-                    logging.info(
-                        f"원본 TTS 길이: {current_duration:.2f} sec, "
-                        f"원하는 길이: {desired_duration:.2f} sec"
-                    )
+                est = len(text) / avg_chars_per_second
+                speed = max(0.7, min(1.2, est / desired))
 
-                    new_duration = adjust_tts_duration(
-                        tts_audio_path, desired_duration
-                    )
+                url = f"{ELEVENLABS_BASE_URL}/text-to-speech/{voice_id}?output_format=mp3_44100_128"
+                headers = {
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "text": text,
+                    "model_id": "eleven_multilingual_v2",
+                    "voice_settings": {"stability":0.5,"similarity_boost":0.75,"style":0.0,"use_speaker_boost":True,"speed":speed}
+                }
 
-                    # 로그 추가: 조정 후 길이 출력
-                    logging.info(
-                        f"조정 후 TTS 길이: {new_duration:.2f} sec "
-                        f"(원본: {current_duration:.2f} sec "
-                        f"→ 조정: {new_duration:.2f} sec)"
-                    )
+                resp = requests.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    logging.error(f"TTS 요청 실패(id={translation_id}): {resp.text}")
+                    continue
 
-                    curs.execute(
-                        """
-                        INSERT INTO tts
-                        (translation_id, file_path, voice, start_time, duration)
-                        VALUES (%s, %s, %s, %s, %s);
-                        """,
-                        (
-                            translation_id,
-                            tts_audio_path,
-                            selected_voice_id,
-                            float(start_time),
-                            float(new_duration),
-                        ),
-                    )
-                except Exception as e:
-                    logging.error(f"TTS 생성 실패: {str(e)}")
-        return JSONResponse(
-            content={"message": "TTS 생성 완료"}, status_code=200
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
+                orig_path = os.path.join(tts_dir, f"{translation_id}.mp3")
+                with open(orig_path, "wb") as f:
+                    f.write(resp.content)
 
+                # 생성된 파일 길이 측정
+                y, sr = librosa.load(orig_path, sr=None)
+                current = librosa.get_duration(y=y, sr=sr)
 
-@app.post("/generate-tts")
-async def generate_tts_custom(request: CustomTTSRequest):
-    try:
-        conn = get_connection()
-        curs = conn.cursor()
-        with get_db_cursor() as curs:
-            if request.tts_id is not None:
-                curs.execute(
-                    """
-                    SELECT translation_id, file_path
-                    FROM tts
-                    WHERE tts_id = %s;
-                    """,
-                    (request.tts_id,),
-                )
-                row = curs.fetchone()
-                if not row:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="해당 tts_id를 찾을 수 없습니다.",
-                    )
-                translation_id, tts_audio_path = row
-                curs.execute(
-                    """
-                    UPDATE translations
-                    SET text = %s
-                    WHERE translation_id = %s;
-                    """,
-                    (request.text, translation_id),
-                )
-                try:
-                    url = (
-                        f"{ELEVENLABS_BASE_URL}/text-to-speech/"
-                        f"{request.voice_id}?output_format=mp3_44100_128"
-                    )
-                    headers = {
-                        "xi-api-key": ELEVENLABS_API_KEY,
-                        "Content-Type": "application/json",
-                    }
-                    payload = {
-                        "text": request.text,
-                        "model_id": "eleven_multilingual_v2",
-                    }
-                    response = requests.post(url, headers=headers, json=payload)
-                    if response.status_code != 200:
-                        raise Exception(
-                            f"ElevenLabs TTS 생성 실패: {response.text}"
-                        )
-                    audio_content = response.content
-                    with open(tts_audio_path, "wb") as tts_file:
-                        tts_file.write(audio_content)
-                    duration = librosa.get_duration(path=tts_audio_path)
-                    curs.execute(
-                        """
-                        UPDATE tts
-                        SET voice = %s, duration = %s
-                        WHERE tts_id = %s;
-                        """,
-                        (request.voice_id, duration, request.tts_id),
-                    )
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"ElevenLabs TTS 생성 실패: {str(e)}",
-                    )
-            else:
-                timestamp = int(time.time())
-                tts_audio_path = os.path.join(
-                    CUSTOM_TTS_FOLDER, f"tts_{timestamp}.mp3"
-                )
-                try:
-                    url = (
-                        f"{ELEVENLABS_BASE_URL}/text-to-speech/"
-                        f"{request.voice_id}?output_format=mp3_44100_128"
-                    )
-                    headers = {
-                        "xi-api-key": ELEVENLABS_API_KEY,
-                        "Content-Type": "application/json",
-                    }
-                    payload = {
-                        "text": request.text,
-                        "model_id": "eleven_multilingual_v2",
-                    }
-                    response = requests.post(url, headers=headers, json=payload)
-                    if response.status_code != 200:
-                        raise Exception(
-                            f"ElevenLabs TTS 생성 실패: {response.text}"
-                        )
-                    audio_content = response.content
-                    with open(tts_audio_path, "wb") as tts_file:
-                        tts_file.write(audio_content)
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"ElevenLabs TTS 생성 실패: {str(e)}",
-                    )
-                curs.execute(
-                    """
-                    INSERT INTO translations (text, language)
-                    VALUES (%s, %s)
-                    RETURNING translation_id;
-                    """,
-                    (request.text, "en"),
-                )
-                translation_id = curs.fetchone()[0]
-                duration = librosa.get_duration(path=tts_audio_path)
+                final_path = orig_path
+                final_duration = current
+
+                if abs(current - desired) > 0.15:
+                    sp = os.path.join(tts_dir, f"{translation_id}_stretched.mp3")
+                    new_dur = stretch_audio(orig_path, sp, current, desired)
+                    final_path, final_duration = sp, new_dur
+                    logging.info(f"Stretch(id={translation_id}): {current:.2f}s→{new_dur:.2f}s")
+                else:
+                    logging.info(f"No stretch needed (id={translation_id}, Δ={abs(current-desired):.2f}s)")
+
                 curs.execute(
                     """
                     INSERT INTO tts
-                    (translation_id, file_path, voice, start_time, duration)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING tts_id;
+                      (translation_id, file_path, voice, start_time, duration)
+                    VALUES (%s,%s,%s,%s,%s);
                     """,
-                    (
-                        translation_id,
-                        tts_audio_path,
-                        request.voice_id,
-                        0.0,
-                        duration,
-                    ),
+                    (translation_id, final_path, voice_id, float(start_time), float(final_duration))
                 )
-                request.tts_id = curs.fetchone()[0]
+
+        return JSONResponse({"message": "TTS 생성 및 stretch 완료"}, status_code=200)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"generate-tts-from-stt 실패: {e}")
+        raise HTTPException(500, f"TTS 처리 실패: {e}")
+
+@app.post("/generate-tts")
+async def generate_tts_custom(
+    text: str = Form(...),           # TTS로 변환할 텍스트
+    voice_id: str = Form(...),       # 사용할 Voice ID
+    user_id: int = Form(...),        # 사용자 식별자
+    tts_id: int = Form(None)         # 수정할 기존 TTS ID (없으면 생성)
+):
+    """
+    user_id, text, voice_id, (tts_id)를 Form 데이터로 받아
+    user_files/{user_id} 폴더에 TTS 파일 생성 및 DB 반영
+    """
+    try:
+        # 사용자별 폴더 생성
+        user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
+        os.makedirs(user_folder, exist_ok=True)
+
+        # DB 커넥션
+        conn = get_connection()
+        curs = conn.cursor()
+
+        # 기존 TTS가 있으면 translations 업데이트, 새로 생성시 삽입
+        if tts_id:
+            curs.execute("SELECT translation_id FROM tts WHERE tts_id = %s;", (tts_id,))
+            row = curs.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="tts_id를 찾을 수 없습니다.")
+            translation_id = row[0]
+            # 번역 텍스트 업데이트
+            curs.execute("UPDATE translations SET text = %s WHERE translation_id = %s;", (text, translation_id))
+            filename = f"tts_{tts_id}.mp3"
+        else:
+            # 신규 번역 레코드 삽입
+            curs.execute(
+                "INSERT INTO translations(text, language) VALUES(%s, %s) RETURNING translation_id;",
+                (text, "en")  # 언어코드는 필요에 따라 수정
+            )
+            translation_id = curs.fetchone()[0]
+            filename = f"tts_{text}.mp3"
+
+        # 파일 경로
+        output_path = os.path.join(user_folder, filename)
+
+        # ElevenLabs TTS 생성
+        url = f"{ELEVENLABS_BASE_URL}/text-to-speech/{voice_id}?output_format=mp3_44100_128"
+        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        resp = requests.post(url, headers=headers, json={"text": text, "model_id": "eleven_multilingual_v2"})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"TTS 생성 실패: {resp.text}")
+
+        # 파일 저장 및 길이 측정
+        with open(output_path, 'wb') as f:
+            f.write(resp.content)
+        duration = librosa.get_duration(path=output_path)
+
+        # DB tts 테이블 반영
+        if tts_id:
+            curs.execute(
+                "UPDATE tts SET voice = %s, duration = %s, file_path = %s WHERE tts_id = %s;",
+                (voice_id, duration, output_path, tts_id)
+            )
+        else:
+            curs.execute(
+                "INSERT INTO tts(translation_id, file_path, voice, start_time, duration) VALUES(%s, %s, %s, %s, %s) RETURNING tts_id;",
+                (translation_id, output_path, voice_id, 0.0, duration)
+            )
+            tts_id = curs.fetchone()[0]
+
         conn.commit()
         curs.close()
         conn.close()
-        tts_file_url = tts_audio_path.replace(AUDIO_FOLDER, "/extracted_audio")
-        return JSONResponse(
-            content={
-                "message": "TTS 생성 완료",
-                "file_url": tts_file_url,
-                "tts_id": request.tts_id,
-            },
-            status_code=200,
-        )
+
+        # URL은 사용하지 않으므로 반환하지 않음
+        return JSONResponse({"message": "TTS 생성 완료", "tts_id": tts_id})
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {str(e)}")
+        logging.error(f"generate-tts error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/create-voice-model")
