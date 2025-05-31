@@ -7,6 +7,7 @@ import librosa
 import shutil
 import subprocess
 import json
+import openai
 from contextlib import contextmanager
 from typing import Optional, List
 
@@ -19,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
+from spleeter.separator import Separator
 
 
 # ----------------------------
@@ -46,6 +48,10 @@ DB_PORT = "5433"
 
 ELEVENLABS_API_KEY = "eleven-key"
 ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1"
+
+# OpenAI API 설정 (번역용)
+OPENAI_API_KEY = "gpt-key"
+openai.api_key = OPENAI_API_KEY
 
 # CORS 설정
 app.add_middleware(
@@ -280,7 +286,7 @@ def adjust_tts_duration(file_path: str, desired_duration: float) -> float:
 # ----------------------------
 # FastAPI 엔드포인트
 # ----------------------------
-app.mount("/videos", StaticFiles(directory="uploaded_videos"), name="videos")
+app.mount("/uploaded_videos", StaticFiles(directory="uploaded_videos"), name="videos")
 app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
 
 @app.get("/")
@@ -348,12 +354,12 @@ async def generate_tts_from_stt(data: dict):
     - video_id로 DB에서 번역·트랜스크립트 조회
     - ElevenLabs TTS 생성
     - 필요 시 pydub 기반 stretch_audio로 길이 보정
-    - tts 테이블에 삽입
+    - tts 테이블에 삽입 (tts_id.mp3 파일명)
     """
     try:
         video_id = data.get("video_id")
         if not video_id:
-            raise HTTPException(400, "video_id가 필요합니다.")
+            raise HTTPException(status_code=400, detail="video_id가 필요합니다.")
 
         speaker_voice_map = {
             "A": "29vD33N1CtxCmqQRPOHJ",
@@ -364,19 +370,18 @@ async def generate_tts_from_stt(data: dict):
         avg_chars_per_second = 15
 
         with get_db_cursor() as curs:
-            curs.execute(
-                """
+            # 1) 번역·트랜스크립트 조회
+            curs.execute("""
                 SELECT t.translation_id, t.text, tr.start_time, tr.end_time, tr.speaker
-                FROM translations t
-                JOIN transcripts tr USING(transcript_id)
-                WHERE tr.video_id = %s;
-                """,
-                (video_id,)
-            )
+                  FROM translations t
+                  JOIN transcripts tr USING (transcript_id)
+                 WHERE tr.video_id = %s;
+            """, (video_id,))
             rows = curs.fetchall()
             if not rows:
-                raise HTTPException(404, "번역 데이터가 없습니다.")
+                raise HTTPException(status_code=404, detail="번역 데이터가 없습니다.")
 
+            # 2) 출력 폴더 준비
             tts_dir = os.path.join(AUDIO_FOLDER, f"{video_id}_tts")
             ensure_folder(tts_dir)
 
@@ -387,9 +392,11 @@ async def generate_tts_from_stt(data: dict):
                     logging.warning(f"잘못된 시간: {start_time}~{end_time} (id={translation_id})")
                     continue
 
+                # 속도 조정 계산
                 est = len(text) / avg_chars_per_second
                 speed = max(0.7, min(1.2, est / desired))
 
+                # ElevenLabs TTS 요청 준비
                 url = f"{ELEVENLABS_BASE_URL}/text-to-speech/{voice_id}?output_format=mp3_44100_128"
                 headers = {
                     "xi-api-key": ELEVENLABS_API_KEY,
@@ -398,40 +405,60 @@ async def generate_tts_from_stt(data: dict):
                 payload = {
                     "text": text,
                     "model_id": "eleven_multilingual_v2",
-                    "voice_settings": {"stability":0.5,"similarity_boost":0.75,"style":0.0,"use_speaker_boost":True,"speed":speed}
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                        "style": 0.0,
+                        "use_speaker_boost": True,
+                        "speed": speed
+                    }
                 }
 
+                # 3) 먼저 tts 레코드 생성 → tts_id 획득 (file_path 빈 문자열로 초기 삽입)
+                curs.execute(
+                    """
+                    INSERT INTO tts
+                      (translation_id, file_path, voice, start_time, duration)
+                    VALUES (%s, %s,         %s,    %s,         %s)
+                    RETURNING tts_id;
+                    """,
+                    (translation_id, "", voice_id, float(start_time), desired)
+                )
+                tts_id = curs.fetchone()[0]
+
+                # 4) TTS 엔진 호출 및 tts_id.mp3로 저장
                 resp = requests.post(url, headers=headers, json=payload)
                 if resp.status_code != 200:
                     logging.error(f"TTS 요청 실패(id={translation_id}): {resp.text}")
                     continue
 
-                orig_path = os.path.join(tts_dir, f"{translation_id}.mp3")
+                orig_path = os.path.join(tts_dir, f"{tts_id}.mp3")
                 with open(orig_path, "wb") as f:
                     f.write(resp.content)
 
-                # 생성된 파일 길이 측정
+                # 5) 길이 측정 및 필요 시 stretch
                 y, sr = librosa.load(orig_path, sr=None)
                 current = librosa.get_duration(y=y, sr=sr)
-
                 final_path = orig_path
                 final_duration = current
 
                 if abs(current - desired) > 0.15:
-                    sp = os.path.join(tts_dir, f"{translation_id}_stretched.mp3")
-                    new_dur = stretch_audio(orig_path, sp, current, desired)
-                    final_path, final_duration = sp, new_dur
-                    logging.info(f"Stretch(id={translation_id}): {current:.2f}s→{new_dur:.2f}s")
+                    stretched_path = os.path.join(tts_dir, f"{tts_id}_stretched.mp3")
+                    new_dur = stretch_audio(orig_path, stretched_path, current, desired)
+                    final_path, final_duration = stretched_path, new_dur
+                    logging.info(f"Stretch(id={translation_id}): {current:.2f}s → {new_dur:.2f}s")
                 else:
                     logging.info(f"No stretch needed (id={translation_id}, Δ={abs(current-desired):.2f}s)")
 
+                # 6) 파일 경로와 최종 길이로 UPDATE
                 curs.execute(
                     """
-                    INSERT INTO tts
-                      (translation_id, file_path, voice, start_time, duration)
-                    VALUES (%s,%s,%s,%s,%s);
+                    UPDATE tts
+                       SET file_path = %s,
+                           duration  = %s
+                     WHERE tts_id   = %s;
                     """,
-                    (translation_id, final_path, voice_id, float(start_time), float(final_duration))
+                    (final_path, float(final_duration), tts_id)
                 )
 
         return JSONResponse({"message": "TTS 생성 및 stretch 완료"}, status_code=200)
@@ -440,7 +467,7 @@ async def generate_tts_from_stt(data: dict):
         raise
     except Exception as e:
         logging.error(f"generate-tts-from-stt 실패: {e}")
-        raise HTTPException(500, f"TTS 처리 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS 처리 실패: {e}")
 
 @app.post("/generate-tts")
 async def generate_tts_custom(
@@ -522,120 +549,76 @@ async def generate_tts_custom(
         logging.error(f"generate-tts error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/create-voice-model")
 async def create_voice_model(
     background_tasks: BackgroundTasks,
     name: str = Form(...),
-    description: str = Form(...),
+    description: str = Form(None),
+    remove_background_noise: bool = Form(False),
     files: List[UploadFile] = File(...),
 ):
     """
-    업로드된 여러 오디오 파일을 받아서,
-    각 파일에 대해 Spleeter로 보컬(음성)만 분리한 후,
-    분리된 보컬 음원을 기반으로 무음 구간을 제거하고 병합/분할하여
-    최대 25개의 샘플 파일을 생성합니다.
-    이 샘플 파일들을 ElevenLabs API에 전달하여 보이스 모델(클론)을 생성하고,
-    생성된 모델 정보를 DB에 저장합니다.
-    작업 완료 후 임시 파일들은 BackgroundTasks를 이용하여 삭제됩니다.
-    
-    **파일 크기는 10MB 이하만 허용됩니다.**
+    업로드된 오디오 파일을 받아 Spleeter로 분리 후 샘플을 생성,
+    ElevenLabs API로 보이스 모델을 만든 뒤 DB에 저장합니다.
     """
     all_sample_parts = []
     temp_paths = []
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
-    MAX_FILE_SIZE = 10 * 1024 * 1024
-
+    # 파일 처리
     for file in files:
         file.file.seek(0, os.SEEK_END)
         size = file.file.tell()
         file.file.seek(0)
         if size > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"파일 {file.filename}의 크기가 10MB를 초과합니다."
-            )
+            raise HTTPException(status_code=400, detail=f"파일 {file.filename}의 크기가 10MB를 초과합니다.")
 
         original_name = os.path.splitext(file.filename)[0]
-        base_name = (
-            original_name[:-len("_audio")]
-            if file.filename.endswith("_audio")
-            else original_name
-        )
-
-        # 파일명을 그대로 사용 (시간 제거)
+        base_name = original_name[:-len("_audio")] if file.filename.endswith("_audio") else original_name
         original_path = os.path.join(AUDIO_FOLDER, f"{base_name}.mp3")
         logging.info(f"📥 파일 저장 시작: {file.filename}")
         with open(original_path, "wb") as f:
             f.write(await file.read())
         temp_paths.append(original_path)
 
-        # Spleeter 실행
+        if remove_background_noise:
+            # TODO: 배경 소음 제거 처리 호출
+            pass
+
         try:
-            from spleeter.separator import Separator
             separator = Separator("spleeter:2stems")
             separator.separate_to_file(original_path, AUDIO_FOLDER)
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Spleeter 실행 실패: {str(e)}"
-            )
+            raise HTTPException(status_code=500, detail=f"Spleeter 실행 실패: {e}")
 
-        # vocals.wav 파일 찾기
         vocal_path, _ = find_spleeter_vocals(AUDIO_FOLDER, base_name)
-
-        # 고정된 이름으로 보컬 파일 저장
         fixed_vocal_path = os.path.join(AUDIO_FOLDER, f"{base_name}_vocals.wav")
         shutil.move(vocal_path, fixed_vocal_path)
         temp_paths.append(fixed_vocal_path)
+        shutil.rmtree(os.path.join(AUDIO_FOLDER, base_name), ignore_errors=True)
+        shutil.rmtree(os.path.join(AUDIO_FOLDER, f"{base_name}_audio"), ignore_errors=True)
 
-        # Spleeter가 생성한 원본 폴더 삭제
-        folder_primary = os.path.join(AUDIO_FOLDER, base_name)
-        if os.path.exists(folder_primary):
-            temp_paths.append(folder_primary)
-            shutil.rmtree(folder_primary, ignore_errors=True)
-
-        folder_alternate = os.path.join(AUDIO_FOLDER, f"{base_name}_audio")
-        if os.path.exists(folder_alternate):
-            temp_paths.append(folder_alternate)
-            shutil.rmtree(folder_alternate, ignore_errors=True)
-
-        # 병합 및 분할
         merge_dir = os.path.join(AUDIO_FOLDER, f"{base_name}_merged")
         os.makedirs(merge_dir, exist_ok=True)
         temp_paths.append(merge_dir)
-        merged_sample_path = merge_nonsilent_audio_improved(
+        merged_sample = merge_nonsilent_audio_improved(
             fixed_vocal_path, merge_dir,
             output_filename="merged_sample.mp3",
             fade_duration=200
         )
-        if not merged_sample_path:
-            raise HTTPException(
-                status_code=500, detail="병합 파일 생성 실패"
-            )
 
         split_dir = os.path.join(AUDIO_FOLDER, f"{base_name}_split")
         os.makedirs(split_dir, exist_ok=True)
         temp_paths.append(split_dir)
-        MAX_MERGED_DURATION_SEC = 30
-        sample_parts = split_merged_audio(
-            merged_sample_path, split_dir,
-            max_duration_sec=MAX_MERGED_DURATION_SEC,
-            max_samples=25
+        parts = split_merged_audio(
+            merged_sample, split_dir,
+            max_duration_sec=30, max_samples=25
         )
-        if not sample_parts:
-            raise HTTPException(
-                status_code=500, detail="병합 후 분할 실패"
-            )
-
-        all_sample_parts.extend(sample_parts)
+        all_sample_parts.extend(parts)
 
     if not all_sample_parts:
-        raise HTTPException(
-            status_code=500, detail="샘플 파일 생성 실패"
-        )
+        raise HTTPException(status_code=500, detail="샘플 파일 생성 실패")
 
-    # ElevenLabs API 호출
     voice_response = create_voice_model_api(
         name=name,
         description=description,
@@ -643,9 +626,10 @@ async def create_voice_model(
     )
     voice_id = voice_response.get("voice_id")
     if not voice_id:
-        raise Exception("보이스 모델 생성 실패: voice_id가 반환되지 않음")
+        raise HTTPException(status_code=500, detail="보이스 모델 생성 실패: voice_id가 반환되지 않았습니다.")
     logging.info(f"✅ 보이스 모델 생성 완료: {voice_id}")
 
+    # DB 저장
     with get_db_cursor() as curs:
         curs.execute(
             """
@@ -653,12 +637,11 @@ async def create_voice_model(
             VALUES (%s, %s, %s)
             RETURNING id;
             """,
-            (voice_id, name, description),
+            (voice_id, name, description)
         )
         inserted_id = curs.fetchone()[0]
-    logging.info(f"📌 DB에 voice_models 테이블에 저장 완료 (id: {inserted_id})")
+    logging.info(f"📌 DB에 voice_models 저장 완료 (id: {inserted_id})")
 
-    # 임시 파일 삭제
     background_tasks.add_task(delete_temp_files, temp_paths)
 
     return JSONResponse(
@@ -671,3 +654,146 @@ async def create_voice_model(
         },
         status_code=200
     )
+
+@app.post("/edit-tts")
+async def edit_tts(
+    tts_id: int = Form(...),
+    voice: str = Form(...),
+    text: str = Form(...)
+):
+    try:
+        logging.info(f"[Edit TTS] tts_id: {tts_id}, voice: {voice}, text: {text}")
+
+        # 1. DB에서 기존 정보 조회
+        with get_db_cursor() as curs:
+            curs.execute('''
+                SELECT 
+                    t.translation_id, 
+                    ts.transcript_id, 
+                    tts.start_time, 
+                    tts.duration, 
+                    tts.file_path, 
+                    ts.text
+                FROM tts
+                JOIN translations t ON t.translation_id = tts.translation_id
+                JOIN transcripts ts ON t.transcript_id = ts.transcript_id
+                WHERE tts.tts_id = %s;
+            ''', (tts_id,))
+            result = curs.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="TTS ID를 찾을 수 없습니다.")
+            translation_id, transcript_id, start_time, duration, original_file_path, original_text = result
+            desired_duration = float(duration)
+
+        # 2. 입력된 한국어 텍스트를 영어로 번역
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Translate this Korean sentence into natural English."},
+                {"role": "user", "content": text}
+            ]
+        )
+        translated_text = response["choices"][0]["message"]["content"].strip()
+
+        # 3. ElevenLabs로 TTS 생성
+        url = f"{ELEVENLABS_BASE_URL}/text-to-speech/{voice}?output_format=mp3_44100_128"
+        headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+        payload = {
+            "text": translated_text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
+        }
+        resp = requests.post(url, headers=headers, json=payload)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"TTS 생성 실패: {resp.text}")
+
+        # 4. 기존 파일과 중복되지 않도록 순번 붙여 저장
+        base_name = os.path.splitext(os.path.basename(original_file_path))[0]
+        base_dir = os.path.dirname(original_file_path)
+        os.makedirs(base_dir, exist_ok=True)
+
+        # 이미 생성된 파일 인덱스 확인
+        existing = [
+            f for f in os.listdir(base_dir)
+            if f.startswith(f"{base_name}_") and f.endswith(".mp3") and not f.endswith("_stretched.mp3")
+        ]
+        indices = []
+        for fname in existing:
+            name_part = os.path.splitext(fname)[0]  # e.g., "file_1"
+            parts = name_part.split("_")
+            if parts[-1].isdigit():
+                indices.append(int(parts[-1]))
+        next_index = max(indices) + 1 if indices else 1
+
+        tts_filename = f"{base_name}_{next_index}.mp3"
+        stretched_filename = f"{base_name}_{next_index}_stretched.mp3"
+        tts_path = os.path.join(base_dir, tts_filename)
+        stretched_path = os.path.join(base_dir, stretched_filename)
+
+        with open(tts_path, "wb") as f:
+            f.write(resp.content)
+
+        # 5. 원하는 길이에 맞춰 time-stretch
+        y, sr = librosa.load(tts_path, sr=None)
+        current_duration = librosa.get_duration(y=y, sr=sr)
+        if abs(current_duration - desired_duration) > 0.15:
+            stretch_audio(tts_path, stretched_path, current_duration, desired_duration)
+            final_path = stretched_path
+        else:
+            final_path = tts_path
+
+        final_duration = librosa.get_duration(path=final_path)
+
+        # 6. DB 업데이트
+        with get_db_cursor() as curs:
+            # transcripts 업데이트
+            curs.execute('''
+                UPDATE transcripts
+                SET text = %s
+                WHERE transcript_id = %s;
+            ''', (text, transcript_id))
+
+            # translations 업데이트
+            curs.execute('''
+                UPDATE translations
+                SET text = %s, language = %s
+                WHERE translation_id = %s;
+            ''', (translated_text, "en", translation_id))
+
+            # tts 업데이트
+            curs.execute('''
+                UPDATE tts
+                SET voice = %s,
+                    duration = %s,
+                    file_path = %s
+                WHERE tts_id = %s;
+            ''', (voice, final_duration, final_path, tts_id))
+
+        return JSONResponse({
+            "id": tts_id,
+            "duration": final_duration,
+            "url": final_path,
+            "translateText": translated_text,
+            "originalText": original_text
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[Edit TTS] 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/voice-models")
+async def list_voice_models():
+    with get_db_cursor() as curs:
+        curs.execute("""
+            SELECT id, name, voice_id, description
+            FROM voice_models
+            ORDER BY id;
+        """)
+        rows = curs.fetchall()
+    models = [
+        {"db_id": row[0], "name": row[1], "voice_id": row[2], "description": row[3]}
+        for row in rows
+    ]
+    return JSONResponse(content=models)

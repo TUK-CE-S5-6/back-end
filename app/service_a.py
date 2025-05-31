@@ -7,7 +7,9 @@ import requests
 import asyncio
 import shutil
 import uuid
+import tempfile
 from typing import List
+from urllib.parse import urlparse
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query, Response, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +61,16 @@ def get_connection():
 # FastAPI 앱 생성
 app = FastAPI()
 
+#앱 루트 디렉토리
+BASE_DIR = os.getcwd()
+
+STATIC_MAP = {
+    '/uploaded_videos/': os.path.join(os.getcwd(), 'uploaded_videos'),
+    '/extracted_audio/': os.path.join(os.getcwd(), 'extracted_audio'),
+    '/user_files/': os.path.join(os.getcwd(), 'user_files'),
+}
+LOCAL_HOSTS = {"175.116.3.178:8000", "localhost:8000", "127.0.0.1:8000"}
+
 #진행률 계산
 PROGRESS = {}       # job_id → percent
 cumulative_pct = {
@@ -72,12 +84,6 @@ cumulative_pct = {
    'get_time': 100
 }
 
-# 정적 파일 제공 (영상 파일과 추출된 오디오 파일)
-app.mount("/videos", StaticFiles(directory="uploaded_videos"), name="videos")
-app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
-app.mount("/user_files", StaticFiles(directory="user_files"), name="user_files")
-app.mount("/thumbnails", StaticFiles(directory="thumbnails"), name="thumbnails")
-
 # CORS 설정
 app.add_middleware(
     CORSMiddleware,
@@ -86,6 +92,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 정적 파일 제공 (영상 파일과 추출된 오디오 파일)
+app.mount("/uploaded_videos", StaticFiles(directory="uploaded_videos"), name="videos")
+app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
+app.mount("/user_files", StaticFiles(directory="user_files"), name="user_files")
+app.mount("/thumbnails", StaticFiles(directory="thumbnails"), name="thumbnails")
+
 
 # 폴더 생성
 UPLOAD_FOLDER = "uploaded_videos"
@@ -129,6 +142,14 @@ class ConnectionManager:
                 self.disconnect(job_id)
 
 ws_manager = ConnectionManager()
+
+class MediaItem(BaseModel):
+    path: str
+    start_time: float
+
+class MergePayload(BaseModel):
+    videos: list[MediaItem]
+    audios: list[MediaItem]
 
 ############################################
 # 회원가입 엔드포인트 (토큰을 JSON에 포함)
@@ -738,83 +759,131 @@ async def upload_video(
     except Exception as e:
         await ws_manager.send_progress(job_id, -1)
         raise HTTPException(status_code=500, detail=f"업로드 실패: {e}")
-
-################################################################################
-# ▶ /merge-media 엔드포인트 (별도 호출 시)
-################################################################################
-@app.post("/merge-media")
-async def merge_media(
-    video: List[UploadFile] = File(...),
-    start_times: str = Form(...),
-    red_track_indices: str = Form(...),
-    audio: UploadFile = File(...)
-):
-    try:
-        try:
-            start_times_list = json.loads(start_times)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"start_times 파싱 실패: {str(e)}")
-
-        try:
-            red_indices = json.loads(red_track_indices)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"red_track_indices 파싱 실패: {str(e)}")
-
-        if len(start_times_list) != len(video) or len(red_indices) != len(video):
-            raise HTTPException(
-                status_code=400,
-                detail="비디오 파일 수와 start_times, red_track_indices 배열의 길이가 일치해야 합니다."
-            )
-
-        temp_folder = "temp"
-        os.makedirs(temp_folder, exist_ok=True)
-
-        video_clips_with_index = []
-        for idx, vid in enumerate(video):
-            video_temp_path = os.path.join(temp_folder, f"video_{int(time.time())}_{vid.filename}")
-            with open(video_temp_path, "wb") as vf:
-                vf.write(await vid.read())
-            clip = VideoFileClip(video_temp_path)
-            clip = clip.set_position((0, 0)).set_start(start_times_list[idx])
-            if clip.audio:
-                clip.audio = clip.audio.set_start(start_times_list[idx])
-            video_clips_with_index.append({
-                "clip": clip,
-                "redIndex": red_indices[idx]
-            })
-
-        if not video_clips_with_index:
-            raise HTTPException(status_code=400, detail="비디오 파일이 없습니다.")
-
-        video_clips_with_index.sort(key=lambda x: x["redIndex"])
-        video_clips_with_index.reverse()
-        sorted_clips = [item["clip"] for item in video_clips_with_index]
-
-        audio_temp_path = os.path.join(temp_folder, f"audio_{int(time.time())}_{audio.filename}")
-        with open(audio_temp_path, "wb") as af:
-            af.write(await audio.read())
-        external_audio = AudioFileClip(audio_temp_path)
-
-        composite_video = CompositeVideoClip(sorted_clips, size=sorted_clips[0].size)
-        video_audio_clips = [clip.audio for clip in sorted_clips if clip.audio is not None]
-        audio_list = video_audio_clips[:]
-        audio_list.append(external_audio)
-        if len(audio_list) > 0:
-            composite_audio = CompositeAudioClip(audio_list)
-            composite_video.audio = composite_audio
-
-        output_path = os.path.join(temp_folder, f"merged_{int(time.time())}.mp4")
-        composite_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
-
-        composite_video.close()
-        for item in video_clips_with_index:
-            item["clip"].close()
-        external_audio.close()
-
-        return FileResponse(path=output_path, filename="merged_output.mp4", media_type="video/mp4")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Merging failed: {str(e)}")
     
+def resolve_local_path(url: str) -> str:
+    parsed = urlparse(url)
+    host = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+    if host in LOCAL_HOSTS:
+        for prefix, dirpath in STATIC_MAP.items():
+            if parsed.path.startswith(prefix):
+                rel = parsed.path[len(prefix):].lstrip("/")
+                return os.path.join(dirpath, rel)
+    return url
+
+@app.post("/merge-media")
+async def merge_media(request: Request):
+    """
+    JSON payload 예시:
+    {
+      "videoTracks": [
+        {
+          "name": "Video Track 1",
+          "volume": 80,
+          "tracks": [
+            { "url": "...mp4", "startTime": 0.0 }
+          ]
+        },
+        {
+          "name": "Video Track 2",
+          "volume": 100,
+          "tracks": [
+            { "url": "...mp4", "startTime": 2.0 }
+          ]
+        }
+      ],
+      "audioTracks": [
+        {
+          "volume": 50,
+          "tracks": [
+            { "url": "...wav", "startTime": 0.0 }
+          ]
+        },
+        {
+          "volume": 100,
+          "tracks": [
+            { "url": "...mp3", "startTime": 3.5 }
+          ]
+        }
+      ]
+    }
+    """
+    payload = await request.json()
+    tempdir = tempfile.mkdtemp(prefix="merge_")
+    video_items = []  # (priority, clip)
+    audio_clips = []
+
+    def fetch_and_resolve(raw_url: str) -> str:
+        path = resolve_local_path(raw_url)
+        if path.startswith("http"):
+            r = requests.get(raw_url, stream=True)
+            r.raise_for_status()
+            ext = os.path.splitext(urlparse(raw_url).path)[1]
+            fn = os.path.join(tempdir, f"dl_{time.time():.0f}{ext}")
+            with open(fn, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+            return fn
+        if not os.path.isfile(path):
+            raise HTTPException(404, f"파일을 찾을 수 없습니다: {path}")
+        return path
+
+    # ▶ 비디오 트랙: name에서 숫자 파싱하여 priority로 사용
+    for group in payload.get("videoTracks", []):
+        name = group.get("name", "")
+        try:
+            # "Video Track 1" → 1
+            priority = int(name.strip().split()[-1])
+        except:
+            priority = 0
+        vol = float(group.get("volume", 100)) / 100.0
+
+        for track in group.get("tracks", []):
+            url   = track.get("url")      or HTTPException(400, "video url 누락")
+            start = float(track.get("startTime", 0))
+            fp    = fetch_and_resolve(url)
+            clip  = VideoFileClip(fp).set_start(start).volumex(vol)
+            video_items.append((priority, clip))
+
+    # ▶ 오디오 트랙: 이름 무시, volume/startTime만
+    for group in payload.get("audioTracks", []):
+        vol = float(group.get("volume", 100)) / 100.0
+        for track in group.get("tracks", []):
+            url   = track.get("url")      or HTTPException(400, "audio url 누락")
+            start = float(track.get("startTime", 0))
+            fp    = fetch_and_resolve(url)
+            ac    = AudioFileClip(fp).set_start(start).volumex(vol)
+            audio_clips.append(ac)
+
+    if not video_items and not audio_clips:
+        raise HTTPException(400, "합성할 트랙이 없습니다.")
+
+    # ▶ priority 순 정렬 (작은 숫자 → 배경, 큰 숫자 → 전경)
+    video_items.sort(key=lambda x: -x[0])
+    ordered_clips = [clip for _, clip in video_items]
+
+    # ▶ 비디오 합성
+    final_video = CompositeVideoClip(
+        ordered_clips,
+        size=ordered_clips[0].size if ordered_clips else None
+    )
+
+    # ▶ 오디오 합성
+    all_audio = [v.audio for v in ordered_clips if v.audio] + audio_clips
+    if all_audio:
+        final_video.audio = CompositeAudioClip(all_audio)
+
+    # ▶ 출력
+    out_path = os.path.join(tempdir, "merged_output.mp4")
+    final_video.write_videofile(out_path, codec="libx264", audio_codec="aac")
+
+    # ▶ 리소스 해제
+    for _, c in video_items: c.close()
+    for a in audio_clips:        a.close()
+
+    return FileResponse(
+        path=out_path,
+        filename="merged_output.mp4",
+        media_type="video/mp4"
+    )
     
 @app.post("/translate-text")
 async def translate_text_endpoint(
@@ -905,7 +974,7 @@ async def file_details(filename: str = Query(..., description="업로드된 비�
         base_name = os.path.splitext(video[1])[0]  # 예: "example" (확장자 제거)
 
         # URL 구성 (정적 파일 제공 경로에 맞게)
-        video_url = f"{BASE_HOST}:8000/videos/{video[1]}"
+        video_url = f"{BASE_HOST}:8000/uploaded_videos/{video[1]}"
         extracted_audio_filename = f"{base_name}.mp3"
         extracted_audio_url = f"{BASE_HOST}:8000/extracted_audio/{extracted_audio_filename}"
 
@@ -1043,4 +1112,3 @@ async def delete_audio_file(
         raise HTTPException(status_code=500, detail=f"파일 삭제 중 오류 발생: {str(e)}")
     
     return {"detail": f"{folder} 폴더의 {file} 파일이 삭제되었습니다."}
- 
