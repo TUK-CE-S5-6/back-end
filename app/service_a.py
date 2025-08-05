@@ -150,6 +150,12 @@ class MediaItem(BaseModel):
 class MergePayload(BaseModel):
     videos: list[MediaItem]
     audios: list[MediaItem]
+    
+class SubtitleSegment(BaseModel):
+    id: int
+    start_time: float
+    end_time: float
+    text: str
 
 ############################################
 # 회원가입 엔드포인트 (토큰을 JSON에 포함)
@@ -268,17 +274,32 @@ async def get_projects(request: Request):
 # 프로젝트 추가
 ############################################
 @app.post("/projects/add")
-async def add_project(request: Request, project_name: str = Form(...), description: str = Form("")):
+async def add_project(
+    request: Request,
+    project_name: str = Form(...),
+    description: str = Form(""),
+    source_language: str = Form("ko-KR"),
+    target_language: str = Form("en-US")
+):
     user_id = get_current_user_id(request)
     try:
         conn = get_connection()
         curs = conn.cursor()
-        curs.execute("INSERT INTO projects (project_name, description, user_id) VALUES (%s, %s, %s) RETURNING project_id", (project_name, description, user_id))
+        curs.execute("""
+            INSERT INTO projects (project_name, description, user_id, source_language, target_language)
+            VALUES (%s, %s, %s, %s, %s) RETURNING project_id
+        """, (project_name, description, user_id, source_language, target_language))
         project_id = curs.fetchone()[0]
         conn.commit()
         curs.close()
         conn.close()
-        return JSONResponse(content={"project_id": project_id, "project_name": project_name, "description": description})
+        return JSONResponse(content={
+            "project_id": project_id,
+            "project_name": project_name,
+            "description": description,
+            "source_language": source_language,
+            "target_language": target_language
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1112,3 +1133,82 @@ async def delete_audio_file(
         raise HTTPException(status_code=500, detail=f"파일 삭제 중 오류 발생: {str(e)}")
     
     return {"detail": f"{folder} 폴더의 {file} 파일이 삭제되었습니다."}
+
+@app.get("/videos/{video_id}/subtitles")
+async def get_video_and_subtitles(video_id: int, request: Request):
+    """
+    video_id에 해당하는 비디오의 상대경로 URL(예: '/uploaded_videos/{file_name}')과,
+    transcripts/translation을 합쳐서 만든 자막 리스트를 반환합니다.
+    """
+    # 1) 인증 검사
+    user_id = get_current_user_id(request)
+
+    conn = None
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+
+        # 2) videos 테이블에서 비디오 정보 조회
+        curs.execute(
+            "SELECT file_name, file_path, duration FROM videos WHERE video_id = %s;",
+            (video_id,)
+        )
+        video_row = curs.fetchone()
+        if not video_row:
+            raise HTTPException(status_code=404, detail="Video not found")
+
+        file_name, file_path, duration = video_row
+        # 상대경로로만 내려줌 (/uploaded_videos/{file_name})
+        relative_video_path = f"/uploaded_videos/{file_name}"
+
+        # 3) transcripts + translations(있으면) 조인해서 자막 조회
+        query = """
+            SELECT
+                t.transcript_id   AS id,
+                t.start_time,
+                t.end_time,
+                COALESCE(tr.text, t.text) AS text
+            FROM transcripts t
+            LEFT JOIN translations tr
+              ON t.transcript_id = tr.transcript_id
+            WHERE t.video_id = %s
+            ORDER BY t.start_time ASC;
+        """
+        curs.execute(query, (video_id,))
+        rows = curs.fetchall()
+        curs.close()
+        conn.close()
+
+        # 4) JSON으로 매핑
+        subtitles = []
+        for row in rows:
+            subtitles.append({
+                "id": int(row[0]),
+                "start_time": float(row[1]),
+                "end_time": float(row[2]),
+                "text": row[3] or ""
+            })
+
+        # 5) 최종 반환: 상대경로 video URL + 자막 배열
+        return JSONResponse(
+            content={
+                "video": {
+                    "video_id": video_id,
+                    "file_name": file_name,
+                    "relative_url": relative_video_path,
+                    "duration": float(duration)
+                },
+                "subtitles": subtitles
+            },
+            status_code=200
+        )
+
+    except HTTPException as he:
+        if conn:
+            conn.close()
+        raise he
+
+    except Exception as e:
+        if conn:
+            conn.close()
+        raise HTTPException(status_code=500, detail=f"DB 조회 실패: {e}")
