@@ -8,6 +8,7 @@ import asyncio
 import shutil
 import uuid
 import tempfile
+import logging
 from typing import List
 from urllib.parse import urlparse
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Query, Response, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
@@ -26,6 +27,21 @@ from moviepy.editor import (
 )
 from typing import Dict
 import moviepy.video.fx.all as vfx
+
+import math
+import subprocess, shlex
+
+# 맨 위 import 구역에 추가
+import numpy as np
+from PIL import Image, ImageDraw
+import librosa
+from uuid import uuid4
+from pathlib import Path
+
+from urllib.parse import urlparse, unquote
+import re
+
+logging.basicConfig(level=logging.DEBUG)
 
 BASE_HOST = "http://175.116.3.178"  # 또는 배포 시 EC2 인스턴스의 공인 IP나 도메인
 
@@ -46,6 +62,8 @@ NAVER_CLOVA_SPEECH_URL = "invoke-url"
 # OpenAI API 설정 (번역용)
 OPENAI_API_KEY = "gpt-key"
 openai.api_key = OPENAI_API_KEY
+
+ASSEMBLYAI_API_KEY = "assemble-key"
 
 # PostgreSQL 연결 함수
 def get_connection():
@@ -93,12 +111,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 정적 파일 제공 (영상 파일과 추출된 오디오 파일)
-app.mount("/uploaded_videos", StaticFiles(directory="uploaded_videos"), name="videos")
-app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
-app.mount("/user_files", StaticFiles(directory="user_files"), name="user_files")
-app.mount("/thumbnails", StaticFiles(directory="thumbnails"), name="thumbnails")
 
+# 폴더 생성 섹션 근처에 추가
+WAVEFORM_FOLDER = "waveforms"
+os.makedirs(WAVEFORM_FOLDER, exist_ok=True)
 
 # 폴더 생성
 UPLOAD_FOLDER = "uploaded_videos"
@@ -112,6 +128,13 @@ os.makedirs(USER_FILES_FOLDER, exist_ok=True)
 
 THUMBNAIL_FOLDER = "thumbnails"
 os.makedirs(THUMBNAIL_FOLDER, exist_ok=True)
+
+# 정적 파일 제공 (영상 파일과 추출된 오디오 파일)
+app.mount("/uploaded_videos", StaticFiles(directory="uploaded_videos"), name="videos")
+app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
+app.mount("/user_files", StaticFiles(directory="user_files"), name="user_files")
+app.mount("/thumbnails", StaticFiles(directory="thumbnails"), name="thumbnails")
+app.mount("/waveforms", StaticFiles(directory=WAVEFORM_FOLDER), name="waveforms")
 
 # Pydantic 모델 (사용자 관련 예시)
 class UserCreate(BaseModel):
@@ -222,6 +245,94 @@ def get_user_id_from_token(request: Request):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token format")
 
+def _run(cmd: str):
+    proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed: {cmd}\n{proc.stderr}")
+    return proc.stdout
+
+def probe_duration(path: str) -> float:
+    out = run_cmd_text_out(
+        f'ffprobe -v error -show_entries format=duration '
+        f'-of default=noprint_wrappers=1:nokey=1 "{path}"'
+    )
+    return float(out.strip())
+
+def make_sprite(input_path: str, out_path: str, thumb_height: int = 100):
+    duration = probe_duration(input_path)
+    tiles = max(1, math.ceil(duration))
+    vf = f'fps=1,scale=-1:{thumb_height},tile={tiles}x1'
+    run_cmd_no_stdout(f'ffmpeg -y -i "{input_path}" -vf "{vf}" -frames:v 1 "{out_path}"')
+    return duration, tiles
+
+
+# --- subprocess safe wrappers ---------------------------------
+def run_cmd_no_stdout(cmd: str) -> None:
+    """
+    파일→파일 변환처럼 stdout이 필요 없을 때.
+    stderr만 UTF-8로 받아서 에러 메시지 확보.
+    """
+    proc = subprocess.run(
+        shlex.split(cmd),
+        stdout=subprocess.DEVNULL,                 # ✅ stdout 비활성(바이너리 섞임 차단)
+        stderr=subprocess.PIPE,
+        text=True, encoding='utf-8', errors='replace'  # ✅ cp949 회피
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f'cmd failed: {cmd}')
+
+def run_cmd_text_out(cmd: str) -> str:
+    """
+    ffprobe처럼 stdout '텍스트' 결과가 필요한 경우.
+    """
+    proc = subprocess.run(
+        shlex.split(cmd),
+        stdout=subprocess.PIPE,                    # ✅ 텍스트 결과 받기
+        stderr=subprocess.PIPE,                    # 로그도 텍스트
+        text=True, encoding='utf-8', errors='replace'
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f'cmd failed: {cmd}')
+    return proc.stdout
+# ---------------------------------------------------------------
+
+# ===== Diarization 기본 힌트(언어별) =====
+DIARIZATION_DEFAULTS = {
+    "ko": {"min": 1, "max": 3},
+    "en": {"min": 1, "max": 3},
+    "ja": {"min": 1, "max": 3},
+    "zh": {"min": 1, "max": 3},
+}
+
+
+def _norm_lang_key(lang: str) -> str:
+    """ 'ko-KR','en-US','ja-JP','zh-CN' → ko/en/ja/zh 로 정규화 """
+    if not lang:
+        return "ko"
+    l = lang.lower()
+    if l.startswith("ko"): return "ko"
+    if l.startswith("en"): return "en"
+    if l.startswith("ja"): return "ja"
+    if l.startswith("zh"): return "zh"
+    return "ko"
+
+def preprocess_audio_for_stt(src_path: str) -> str:
+    """
+    STT 안정화를 위한 경량 전처리:
+    - mono, 16kHz
+    - 기본 필터(고역/저역 + dynaudnorm)
+    결과를 임시 wav로 반환
+    """
+    out_path = os.path.join(tempfile.gettempdir(), f"stt_{uuid4().hex}.wav")
+    # ffmpeg 빌드에 dynaudnorm 포함(기본 full build엔 포함됨)
+    # 필터는 과하지 않게: 고역 120Hz, 저역 3800Hz, 다이나믹 노멀라이즈
+    cmd = (
+        f'ffmpeg -y -i "{src_path}" -ac 1 -ar 16000 -vn '
+        f'-af "highpass=f=120,lowpass=f=3800,dynaudnorm=f=200:g=15" '
+        f'"{out_path}"'
+    )
+    run_cmd_no_stdout(cmd)
+    return out_path
 
 ############################################
 # 현재 로그인한 사용자 정보
@@ -239,19 +350,17 @@ async def get_projects(request: Request):
     user_id = get_current_user_id(request)
     conn = get_connection()
     curs = conn.cursor()
-    # 프로젝트와 연결된 최소 video_id(=첫 영상)를 가져오도록 JOIN
     curs.execute("""
         SELECT p.project_id,
                p.project_name,
                p.description,
                p.created_at,
                MIN(v.video_id) AS first_video_id
-        FROM projects p
-        LEFT JOIN videos v
-          ON v.project_id = p.project_id
-        WHERE p.user_id = %s
-        GROUP BY p.project_id, p.project_name, p.description, p.created_at
-        ORDER BY p.created_at DESC;
+          FROM projects p
+          LEFT JOIN videos v ON v.project_id = p.project_id
+         WHERE p.user_id = %s
+         GROUP BY p.project_id, p.project_name, p.description, p.created_at
+         ORDER BY p.created_at DESC;
     """, (user_id,))
     rows = curs.fetchall()
     curs.close()
@@ -259,16 +368,30 @@ async def get_projects(request: Request):
 
     projects = []
     for project_id, name, desc, created_at, first_video_id in rows:
+        # cover 우선, 없으면 sprite
+        thumb_cover_rel = f"/thumbnails/{first_video_id}-cover.jpg" if first_video_id else None
+        thumb_sprite_rel = f"/thumbnails/{first_video_id}.png"       if first_video_id else None
+
+        cover_abs = os.path.join(THUMBNAIL_FOLDER, f"{first_video_id}-cover.jpg") if first_video_id else None
+        sprite_abs = os.path.join(THUMBNAIL_FOLDER, f"{first_video_id}.png")       if first_video_id else None
+
+        if first_video_id and cover_abs and os.path.exists(cover_abs):
+            thumbnail_url = thumb_cover_rel
+        elif first_video_id and sprite_abs and os.path.exists(sprite_abs):
+            thumbnail_url = thumb_sprite_rel
+        else:
+            thumbnail_url = None
+
         projects.append({
             "project_id": project_id,
             "project_name": name,
             "description": desc,
             "created_at": created_at.isoformat() if created_at else None,
-            "video_id": first_video_id  # 여기 추가
+            "video_id": first_video_id,
+            "thumbnail_url": thumbnail_url,
         })
 
     return JSONResponse(content={"projects": projects})
-
 
 ############################################
 # 프로젝트 추가
@@ -409,7 +532,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             copyfile(save_path, thumb_path)
         else:
             # 기타 파일은 placeholder 사용
-            placeholder = "static/file-placeholder.jpg"
+            placeholder = "static/audio-placeholder.png"
             from shutil import copyfile
             copyfile(placeholder, thumb_path)
     except Exception as e:
@@ -423,43 +546,123 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         status_code=201
     )
 
-# 2. 사용자별 파일 목록 조회
+# 2. 사용자별 파일 목록 조회 (디스크 + DB sound_effects 병합)
 @app.get("/user-files")
 async def list_user_files(request: Request):
-    user_id = get_user_id_from_token(request)
+    user_id = get_user_id_from_token(request)  # 기존 로그인 방식
     user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
-    if not os.path.exists(user_folder):
-        return {"files": []}
 
-    files_info = []
-    for name in os.listdir(user_folder):
-        file_path = os.path.join(user_folder, name)
-        if os.path.isfile(file_path):
-            base_name, _ = os.path.splitext(name)
-            files_info.append({
+    items = []
+
+    # ── 디스크 파일 수집
+    if os.path.exists(user_folder):
+        for name in os.listdir(user_folder):
+            fp = os.path.join(user_folder, name)
+            if not os.path.isfile(fp):
+                continue
+            base, _ = os.path.splitext(name)
+            thumb_path = os.path.join(THUMBNAIL_FOLDER, f"{base}_thumbnail.jpg")
+            thumb_url = f"/thumbnails/{base}_thumbnail.jpg" if os.path.exists(thumb_path) else "/thumbnails/audio-placeholder.png"
+            items.append({
                 "file_name": name,
                 "file_url": f"/user_files/{user_id}/{name}",
-                "thumbnail_url": f"/thumbnails/{base_name}_thumbnail.jpg"
+                "thumbnail_url": thumb_url,
+                "_source": "disk",
+                "_mtime": os.path.getmtime(fp),
             })
-    return {"files": files_info}
 
-# 3. 사용자별 파일 삭제
+    # ── DB 프리셋 수집
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        curs.execute("""
+            SELECT name, description, file_path, thumbnail_url, duration, created_at
+              FROM sound_effects
+             WHERE user_id = %s
+             ORDER BY created_at DESC
+        """, (user_id,))
+        rows = curs.fetchall()
+        for name, desc, file_path, thumb, duration, created_at in rows:
+            file_url = file_path
+            file_name = os.path.basename(file_path) if file_path else (name or "sound.mp3")
+            items.append({
+                "file_name": file_name,
+                "file_url": file_url,
+                # DB에서 가져온 썸네일 사용, 없으면 placeholder
+                "thumbnail_url": thumb if thumb else "/thumbnails/audio-placeholder.png",
+                "duration": float(duration) if duration is not None else None,
+                "_source": "db",
+                "_ctime": created_at.timestamp() if created_at else 0,
+            })
+    except Exception as e:
+        logging.error(f"DB 조회 실패: {e}")
+    finally:
+        try:
+            curs.close()
+            conn.close()
+        except:
+            pass
+
+    # ── 중복 제거 (DB 우선)
+    merged = {}
+    for it in items:
+        key = it["file_url"]
+        if key not in merged or it.get("_source") == "db":
+            merged[key] = it
+
+    files = list(merged.values())
+    files.sort(key=lambda x: (x.get("_ctime", 0), x.get("_mtime", 0)), reverse=True)
+
+    for f in files:
+        f.pop("_source", None)
+        f.pop("_ctime", None)
+        f.pop("_mtime", None)
+
+    return {"files": files}
+
+# 3. 사용자별 파일 삭제 (디스크 + DB sound_effects 정리)
 @app.delete("/user-files")
 async def delete_user_file(request: Request, file: str = Query(...)):
     user_id = get_user_id_from_token(request)
     user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
     file_path = os.path.join(user_folder, file)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
-    os.remove(file_path)
 
-    # 썸네일도 제거
-    base_name, _ = os.path.splitext(file)
-    thumb_path = os.path.join(THUMBNAIL_FOLDER, f"{base_name}_thumbnail.jpg")
-    if os.path.exists(thumb_path):
-        os.remove(thumb_path)
+    # ── 디스크 파일 삭제 (있을 때만)
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"파일 삭제 실패: {e}")
+
+        # 썸네일 삭제(있으면)
+        base_name, _ = os.path.splitext(file)
+        thumb_path = os.path.join(THUMBNAIL_FOLDER, f"{base_name}_thumbnail.jpg")
+        if os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except:
+                pass
+
+    # ── DB 프리셋 레코드 삭제(있으면)
+    file_url = f"/user_files/{user_id}/{file}"
+    try:
+        conn = get_connection()
+        curs = conn.cursor()
+        curs.execute(
+            "DELETE FROM sound_effects WHERE user_id = %s AND file_path = %s",
+            (user_id, file_url)
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            curs.close(); conn.close()
+        except:
+            pass
 
     return {"detail": "파일 삭제 성공"}
+
 
 # 인증 헬퍼 함수 (예시)
 def get_user_id_from_token(request: Request) -> int:
@@ -482,93 +685,190 @@ async def download_file(request: Request, file_name: str = Query(...)):
 ############################################
 # Clova Speech Long Sentence STT 호출 함수 (Secret Key 사용)
 ############################################
-def clova_speech_stt(file_path: str, completion="sync", language="ko-KR", 
-                     wordAlignment=True, fullText=True,
-                     speakerCountMin=-1, speakerCountMax=-1) -> dict:
+def clova_speech_stt(
+    file_path: str,
+    completion: str = "sync",
+    language: str = "ko-KR",
+    wordAlignment: bool = True,
+    fullText: bool = True,
+    speakerCountMin: int | None = None,
+    speakerCountMax: int | None = None,
+) -> dict:
     """
-    주어진 오디오 파일(file_path)을 Clova Speech Long Sentence API를 통해 전송하여,
-    인식 결과 전체 JSON을 반환합니다.
+    Clova Speech Long Sentence API 호출.
+    - speakerCountMin/Max를 넘기지 않으면 언어별 기본값(1~3명)을 적용.
+    - 넘기면 전달값을 우선 사용.
     """
+    # 기본값 보정
+    key = _norm_lang_key(language)
+    dflt = DIARIZATION_DEFAULTS.get(key, {"min": 1, "max": 3})
+    spk_min = speakerCountMin if speakerCountMin is not None else dflt["min"]
+    spk_max = speakerCountMax if speakerCountMax is not None else dflt["max"]
+    if spk_min < 1: spk_min = 1
+    if spk_max < spk_min: spk_max = spk_min
+
     diarization = {
         "enable": True,
-        "speakerCountMin": 1,
-        "speakerCountMax": speakerCountMax
+        "speakerCountMin": int(spk_min),
+        "speakerCountMax": int(spk_max),
     }
+
     request_body = {
         "language": language,
         "completion": completion,
         "wordAlignment": wordAlignment,
         "fullText": fullText,
-        "diarization": diarization
+        "diarization": diarization,
     }
+
     headers = {
         "Accept": "application/json; charset=UTF-8",
-        "X-CLOVASPEECH-API-KEY": NAVER_CLOVA_SECRET_KEY
+        "X-CLOVASPEECH-API-KEY": NAVER_CLOVA_SECRET_KEY,
     }
+
     files = {
         "media": open(file_path, "rb"),
-        "params": (None, json.dumps(request_body).encode("UTF-8"), "application/json")
+        "params": (None, json.dumps(request_body).encode("UTF-8"), "application/json"),
     }
-    url = NAVER_CLOVA_SPEECH_URL + "/recognizer/upload"
-    response = requests.post(url, headers=headers, files=files)
-    files["media"].close()
+    try:
+        url = NAVER_CLOVA_SPEECH_URL + "/recognizer/upload"
+        response = requests.post(url, headers=headers, files=files, timeout=120)
+    finally:
+        files["media"].close()
+
     if response.status_code != 200:
-        print("Clova Speech Long Sentence API 호출 실패:", response.status_code, response.text)
+        print("Clova Speech API 실패:", response.status_code, response.text)
         return {}
-    result = response.json()
-    return result
+    return response.json()
 
 ############################################
-# STT 변환 (Clova Speech Long Sentence STT 사용, 화자 인식 포함)
-# 이제 클라이언트가 전달한 source_language 값을 사용합니다.
+# AssemblyAI 다이아리제이션 + 트랜스크립션
 ############################################
-async def transcribe_audio(audio_path: str, video_id: int, source_language: str):
-    step_start = time.time()
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"STT 변환 실패: {audio_path} 파일이 존재하지 않습니다.")
-    
-    result = clova_speech_stt(
-        audio_path,
-        completion="sync",
-        language=source_language,  # 클라이언트가 보낸 언어 코드 사용 (예: "ko-KR", "en-US", "ja", 등)
-        wordAlignment=True,
-        fullText=True,
-        speakerCountMin=1,
-        speakerCountMax=3
+def call_assemblyai_with_diarization(audio_path: str) -> dict:
+    headers = {
+        "authorization": ASSEMBLYAI_API_KEY,
+        "content-type": "application/json"
+    }
+    # 1) 파일 업로드
+    with open(audio_path, "rb") as f:
+        upload_resp = requests.post(
+            "https://api.assemblyai.com/v2/upload",
+            headers={"authorization": ASSEMBLYAI_API_KEY},
+            data=f
+        )
+    upload_resp.raise_for_status()
+    upload_url = upload_resp.json()["upload_url"]
+
+    # 2) 트랜스크립션 + 스피커 라벨 요청
+    transcript_req = {
+        "audio_url": upload_url,
+        "speaker_labels": True
+    }
+    transcript_resp = requests.post(
+        "https://api.assemblyai.com/v2/transcript",
+        json=transcript_req,
+        headers=headers
     )
-    if not result:
-        raise HTTPException(status_code=500, detail="Clova Speech STT 호출 실패")
-    
+    transcript_resp.raise_for_status()
+    transcript_id = transcript_resp.json()["id"]
+
+    # 3) 완료될 때까지 폴링
+    while True:
+        status_resp = requests.get(
+            f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
+            headers=headers
+        )
+        status_resp.raise_for_status()
+        result = status_resp.json()
+        if result["status"] == "completed":
+            return result
+        if result["status"] == "error":
+            raise HTTPException(status_code=500, detail=result.get("error"))
+        time.sleep(3)
+
+
+############################################
+# STT 변환 함수 (영어→AssemblyAI, 기타→Clova)
+############################################
+async def transcribe_audio(
+    audio_path: str,
+    video_id: int,
+    source_language: str,
+    speaker_min: int | None = None,
+    speaker_max: int | None = None,
+):
+    """
+    영어(en*)는 AssemblyAI(+speaker_labels),
+    그 외(ko/ja/zh 등)는 Clova + diarization(기본 1~3명) 사용.
+    speaker_min/max 인자를 주면 그 값으로 오버라이드.
+    """
+    start_time = time.time()
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
     conn = get_connection()
     curs = conn.cursor()
-    if "segments" in result:
-        for seg in result["segments"]:
-            start_sec = seg.get("start", 0) / 1000.0
-            end_sec = seg.get("end", 0) / 1000.0
-            text = seg.get("text", "")
-            speaker_info = seg.get("speaker", {})
-            speaker = speaker_info.get("name", speaker_info.get("label", ""))
-            curs.execute(
-                """
-                INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
-                VALUES (%s, %s, %s, %s, %s, %s);
-                """,
-                (video_id, source_language, text, start_sec, end_sec, speaker)
-            )
-    else:
-        curs.execute(
-            """
-            INSERT INTO transcripts (video_id, language, text, start_time, end_time, speaker)
-            VALUES (%s, %s, %s, %s, %s, %s);
-            """,
-            (video_id, source_language, result.get("text", ""), 0, 0, "")
-        )
-    conn.commit()
-    curs.close()
-    conn.close()
 
-    stt_time = time.time() - step_start
-    return {"stt_time": stt_time}
+    try:
+        # ---- 영어 : AssemblyAI ----
+        if source_language.lower().startswith("en"):
+            result = call_assemblyai_with_diarization(audio_path)
+            for utt in result.get("utterances", []):
+                s   = float(utt["start"]) / 1000.0
+                e   = float(utt["end"])   / 1000.0
+                txt = utt.get("text", "")
+                spk = utt.get("speaker", "")
+                curs.execute(
+                    """
+                    INSERT INTO transcripts
+                      (video_id, language, text, start_time, end_time, speaker)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (video_id, source_language, txt, s, e, spk),
+                )
+
+        # ---- 그 외 언어 : Clova ----
+        else:
+            # 언어별 기본값(1~3) 적용 또는 인자 오버라이드
+            if speaker_min is None or speaker_max is None:
+                key = _norm_lang_key(source_language)
+                dflt = DIARIZATION_DEFAULTS.get(key, {"min": 1, "max": 3})
+                speaker_min = dflt["min"] if speaker_min is None else speaker_min
+                speaker_max = dflt["max"] if speaker_max is None else speaker_max
+
+            result = clova_speech_stt(
+                audio_path,
+                language=source_language,
+                speakerCountMin=speaker_min,
+                speakerCountMax=speaker_max,
+            )
+
+            # Clova 응답 파싱
+            for seg in result.get("segments", []):
+                s = float(seg.get("start", 0)) / 1000.0
+                e = float(seg.get("end",   0)) / 1000.0
+                txt = seg.get("text", "")
+                spk_info = seg.get("speaker", {}) or {}
+                spk = spk_info.get("name") or spk_info.get("label") or ""
+                curs.execute(
+                    """
+                    INSERT INTO transcripts
+                      (video_id, language, text, start_time, end_time, speaker)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (video_id, source_language, txt, s, e, spk),
+                )
+
+        conn.commit()
+        return {"stt_time": time.time() - start_time}
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        curs.close()
+        conn.close()
+
 
 ############################################
 # 번역 및 DB 저장
@@ -610,26 +910,35 @@ async def get_edit_data(video_id: int):
     step_start = time.time()
     conn = get_connection()
     curs = conn.cursor()
+
     curs.execute("SELECT video_id, file_name, file_path, duration FROM videos WHERE video_id = %s;", (video_id,))
     video = curs.fetchone()
     if not video:
         raise HTTPException(status_code=404, detail="해당 비디오를 찾을 수 없습니다.")
+
+    duration = float(video[3])
     video_data = {
         "video_id": video[0],
         "file_name": video[1],
         "file_path": video[2],
-        "duration": float(video[3])
+        "duration": duration,
+        "thumbnail_url": f"/thumbnails/{video[0]}.png",
+        "width_px": int(math.ceil(duration) * 100),
     }
-    curs.execute("SELECT file_path, volume FROM background_music WHERE video_id = %s;", (video_id,))
+
+    curs.execute("SELECT file_path, volume, waveform_url FROM background_music WHERE video_id=%s;", (video_id,))
     bgm = curs.fetchone()
     background_music = {
         "file_path": bgm[0] if bgm else None,
-        "volume": float(bgm[1]) if bgm else 1.0
+        "volume": float(bgm[1]) if bgm else 1.0,
+        "waveform_url": bgm[2] if bgm else None,
     }
+
     curs.execute(
         """
         SELECT t.tts_id, t.file_path, t.voice, t.start_time, t.duration, 
-               tr.text as translated_text, ts.text as original_text, ts.speaker
+            tr.text as translated_text, ts.text as original_text, ts.speaker,
+            t.waveform_url
         FROM tts t
         JOIN translations tr ON t.translation_id = tr.translation_id
         JOIN transcripts ts ON tr.transcript_id = ts.transcript_id
@@ -646,11 +955,13 @@ async def get_edit_data(video_id: int):
             "duration": float(row[4]),
             "translated_text": row[5],
             "original_text": row[6],
-            "speaker": row[7]
+            "speaker": row[7],
+            "waveform_url": row[8],
         }
         for row in curs.fetchall()
     ]
     conn.close()
+
     total_get_time = time.time() - step_start
     return JSONResponse(content={
         "video": video_data,
@@ -715,7 +1026,7 @@ async def upload_video(
         await ws_manager.send_progress(job_id, cumulative_pct['spleeter_time'])
         await asyncio.sleep(1)
 
-        # 4. DB 저장
+        # 4. DB 저장 (videos + background_music)
         def save_video(file_name, path, dur, proj_id):
             conn = get_connection()
             curs = conn.cursor()
@@ -734,18 +1045,47 @@ async def upload_video(
         await ws_manager.send_progress(job_id, cumulative_pct['db_time'])
         await asyncio.sleep(1)
 
-        # 썸네일 생성 (첫 프레임)
-        clip = VideoFileClip(file_path)
-        thumb_dir = "thumbnails"
+        # 4-1. 썸네일(스프라이트 PNG) 생성
+        thumb_dir = THUMBNAIL_FOLDER
         os.makedirs(thumb_dir, exist_ok=True)
-        thumb_path = os.path.join(thumb_dir, f"{video_id}.jpg")
+        sprite_path = os.path.join(thumb_dir, f"{video_id}.png")
+        duration, tiles = make_sprite(file_path, sprite_path, thumb_height=100)
+        width_px = int(math.ceil(duration) * 100)
 
-        # t=0초(또는 원하는 시간)를 지정해서 프레임을 저장
-        clip.save_frame(thumb_path, t=0)
+        # 4-2. 커버 JPG 생성 (첫 프레임)
+        cover_path = os.path.join(thumb_dir, f"{video_id}-cover.jpg")
+        try:
+            with VideoFileClip(file_path) as cover_clip:
+                cover_clip.save_frame(cover_path, t=0.0)
+        except Exception:
+            try:
+                with VideoFileClip(file_path) as cover_clip:
+                    cover_clip.save_frame(cover_path, t=max(0.0, duration/2))
+            except Exception as e:
+                logging.warning(f"cover thumbnail failed: {e}")
 
-        clip.close()
+        # 4-3. 🔹 BGM 파형 PNG 생성 + DB 반영
+        try:
+            bgm_path = separation_data.get('bgm_path')  # Spleeter 결과의 accompaniment 경로
+            if bgm_path and os.path.exists(bgm_path):
+                wave_name = f"bgm_{video_id}.png"
+                wave_path = os.path.join(WAVEFORM_FOLDER, wave_name)
+                # 타임라인 규칙: 1초 = 100px
+                generate_waveform_png(bgm_path, wave_path, width_px=width_px, height_px=100)
 
-        # 5. STT (클로바)
+                def update_bgm_waveform(vid, url):
+                    conn = get_connection(); curs = conn.cursor()
+                    curs.execute(
+                        "UPDATE background_music SET waveform_url=%s WHERE video_id=%s;",
+                        (url, vid)
+                    )
+                    conn.commit(); curs.close(); conn.close()
+
+                await to_thread(update_bgm_waveform, video_id, f"/waveforms/{wave_name}")
+        except Exception as e:
+            logging.warning(f"BGM waveform generation failed: {e}")
+
+        # 5. STT
         stt_timings = await transcribe_audio(
             separation_data.get('vocals_path'),
             video_id,
@@ -761,8 +1101,7 @@ async def upload_video(
         await ws_manager.send_progress(job_id, cumulative_pct['translation_time'])
         await asyncio.sleep(1)
 
-        # 7. TTS 생성
-        step_start = time.time()
+        # 7. TTS 생성 (TTS 파형은 service_b에서 생성/저장)
         await to_thread(
             lambda vid: requests.post(f"{API_HOST}/generate-tts-from-stt", json={'video_id': vid}).raise_for_status(),
             video_id
@@ -771,7 +1110,6 @@ async def upload_video(
         await asyncio.sleep(1)
 
         # 8. 최종 데이터 조회
-        # 내부적으로 DB에서 최종 edit data를 구성
         _ = await get_edit_data(video_id)
         await ws_manager.send_progress(job_id, cumulative_pct['get_time'])
 
@@ -780,132 +1118,275 @@ async def upload_video(
     except Exception as e:
         await ws_manager.send_progress(job_id, -1)
         raise HTTPException(status_code=500, detail=f"업로드 실패: {e}")
-    
+
 def resolve_local_path(url: str) -> str:
     parsed = urlparse(url)
     host = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+
+    # ✅ URL 경로를 디코드 + // 정리
+    p = unquote((parsed.path or "/")).replace("//", "/")
+
     if host in LOCAL_HOSTS:
         for prefix, dirpath in STATIC_MAP.items():
-            if parsed.path.startswith(prefix):
-                rel = parsed.path[len(prefix):].lstrip("/")
+            if p.startswith(prefix) or p.startswith("/" + prefix.lstrip("/")):
+                use_prefix = prefix if p.startswith(prefix) else ("/" + prefix.lstrip("/"))
+                # ✅ 상대 경로도 디코드
+                rel = unquote(p[len(use_prefix):]).lstrip("/")
                 return os.path.join(dirpath, rel)
+
+    # ✅ host 없는 상대경로도 처리 (예: "/uploaded_videos/..")
+    if not host:
+        for prefix, dirpath in STATIC_MAP.items():
+            if p.startswith(prefix) or p.startswith("/" + prefix.lstrip("/")):
+                use_prefix = prefix if p.startswith(prefix) else ("/" + prefix.lstrip("/"))
+                rel = unquote(p[len(use_prefix):]).lstrip("/")
+                return os.path.join(dirpath, rel)
+
     return url
+
+
+# --- ASS subtitle helpers ------------------------------------
+
+def _ass_escape(text: str) -> str:
+    # ASS 제어문자 이스케이프
+    return (text or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+def _ff_color_to_ass(color: str) -> str:
+    """
+    #RRGGBB -> &HBBGGRR& (ASS BGR)
+    """
+    if not color or not color.startswith("#") or len(color) != 7:
+        return "&HFFFFFF&"  # 기본 흰색
+    r = color[1:3]; g = color[3:5]; b = color[5:7]
+    return f"&H{b}{g}{r}&"
+
+def _sec_to_ass_time(t: float) -> str:
+    # 0.00s -> 0:00:00.00
+    if t < 0: t = 0
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = t % 60
+    return f"{h:d}:{m:02d}:{s:05.2f}"
+
+def write_ass(subs: list, ass_path: str, width: int = 1280, height: int = 720):
+    def _esc(s: str) -> str:
+        return (s or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+    def _ff_to_ass_bgr(hexrgb: str) -> str:
+        if not hexrgb or not hexrgb.startswith("#") or len(hexrgb) != 7:
+            return "&HFFFFFF&"
+        r, g, b = hexrgb[1:3], hexrgb[3:5], hexrgb[5:7]
+        return f"&H{b}{g}{r}&"
+
+    def _sec(t: float) -> str:
+        if t < 0: t = 0
+        h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+        return f"{h:d}:{m:02d}:{s:05.2f}"
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+WrapStyle: 2
+PlayResX: {width}
+PlayResY: {height}
+
+[V4+ Styles]
+; Fontsize=28 → 클라이언트 캔버스 폰트와 동일
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Pretendard,28,&H00FFFFFF,&H000000FF,&HDD000000,&H99000000,0,0,0,0,100,100,0,0,3,4,0,2,60,60,28,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    lines = [header]
+
+    for item in subs:
+        text = _esc(str(item.get("text", "")))
+        start = float(item.get("start", 0.0))
+        end = float(item.get("end", start + 1.0))
+        if end <= start:
+            end = start + 1.0
+
+        cue_color = _ff_to_ass_bgr(item.get("color", "#FFFFFF"))
+        # 좌우 컬러 바 표시
+        ass_text = f"{{\\c{cue_color}}}▌{{\\c&H00FFFFFF&}} {text} {{\\c{cue_color}}}▌"
+
+        lines.append(
+            f"Dialogue: 0,{_sec(start)},{_sec(end)},Default,,0,0,0,,{ass_text}\n"
+        )
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
 @app.post("/merge-media")
 async def merge_media(request: Request):
     """
-    JSON payload 예시:
+    요청 예시(payload):
     {
       "videoTracks": [
         {
           "name": "Video Track 1",
           "volume": 80,
           "tracks": [
-            { "url": "...mp4", "startTime": 0.0 }
-          ]
-        },
-        {
-          "name": "Video Track 2",
-          "volume": 100,
-          "tracks": [
-            { "url": "...mp4", "startTime": 2.0 }
+            { "url": "...mp4", "startTime": 0.0, "duration": 5.2 }
           ]
         }
       ],
       "audioTracks": [
         {
-          "volume": 50,
-          "tracks": [
-            { "url": "...wav", "startTime": 0.0 }
-          ]
-        },
-        {
           "volume": 100,
           "tracks": [
-            { "url": "...mp3", "startTime": 3.5 }
+            { "url": "...mp3", "startTime": 0.0, "duration": 3.0 }
           ]
         }
+      ],
+      "canvas": { "width": 1280, "height": 720 },
+      "subtitles": [
+        { "text": "Hello", "start": 1.2, "end": 3.5, "color": "#FFFFFF" }
       ]
     }
     """
     payload = await request.json()
     tempdir = tempfile.mkdtemp(prefix="merge_")
+
+    # ----- 캔버스/자막(옵션) -----
+    canvas = payload.get("canvas") or {}
+    canvas_w = int(canvas.get("width", 1280))
+    canvas_h = int(canvas.get("height", 720))
+    subtitles = payload.get("subtitles", []) or []
+
     video_items = []  # (priority, clip)
     audio_clips = []
 
     def fetch_and_resolve(raw_url: str) -> str:
-        path = resolve_local_path(raw_url)
-        if path.startswith("http"):
-            r = requests.get(raw_url, stream=True)
-            r.raise_for_status()
-            ext = os.path.splitext(urlparse(raw_url).path)[1]
-            fn = os.path.join(tempdir, f"dl_{time.time():.0f}{ext}")
-            with open(fn, "wb") as f:
-                shutil.copyfileobj(r.raw, f)
-            return fn
-        if not os.path.isfile(path):
-            raise HTTPException(404, f"파일을 찾을 수 없습니다: {path}")
-        return path
+        logging.info(f"[merge] raw_url={raw_url}")
+        path_or_url = resolve_local_path(raw_url)
+        logging.info(f"[merge] resolved={path_or_url}")
 
-    # ▶ 비디오 트랙: name에서 숫자 파싱하여 priority로 사용
-    for group in payload.get("videoTracks", []):
+        if isinstance(path_or_url, str) and not path_or_url.startswith("http"):
+            path_or_url = unquote(path_or_url)
+            exists = os.path.isfile(path_or_url)
+            logging.info(f"[merge] isfile={exists}")
+            if not exists:
+                raise HTTPException(404, f"파일을 찾을 수 없습니다: {raw_url} -> {path_or_url}")
+            return path_or_url
+
+        # 원격(URL)인 경우에만 다운로드
+        r = requests.get(path_or_url, stream=True, timeout=300)  # 타임아웃 여유
+        r.raise_for_status()
+        ext = os.path.splitext(urlparse(path_or_url).path)[1] or ".bin"
+        fn = os.path.join(tempdir, f"dl_{time.time():.0f}{ext}")
+        with open(fn, "wb") as f:
+            shutil.copyfileobj(r.raw, f)
+        return fn
+
+
+    # ----- 비디오 트랙 구성 -----
+    for group in payload.get("videoTracks", []) or []:
         name = group.get("name", "")
         try:
-            # "Video Track 1" → 1
+            # "Video Track 1" → 1 (숫자 없으면 0)
             priority = int(name.strip().split()[-1])
-        except:
+        except Exception:
             priority = 0
         vol = float(group.get("volume", 100)) / 100.0
 
-        for track in group.get("tracks", []):
-            url   = track.get("url")      or HTTPException(400, "video url 누락")
+        for track in group.get("tracks", []) or []:
+            url = track.get("url")
+            if not url:
+                raise HTTPException(status_code=400, detail="video url 누락")
             start = float(track.get("startTime", 0))
-            fp    = fetch_and_resolve(url)
-            clip  = VideoFileClip(fp).set_start(start).volumex(vol)
-            video_items.append((priority, clip))
+            fp = fetch_and_resolve(url)
 
-    # ▶ 오디오 트랙: 이름 무시, volume/startTime만
-    for group in payload.get("audioTracks", []):
+            vclip = VideoFileClip(fp).set_start(start).without_audio()
+            video_items.append((priority, vclip))
+
+    # ----- 오디오 트랙 구성 -----
+    for group in payload.get("audioTracks", []) or []:
         vol = float(group.get("volume", 100)) / 100.0
-        for track in group.get("tracks", []):
-            url   = track.get("url")      or HTTPException(400, "audio url 누락")
+        for track in group.get("tracks", []) or []:
+            url = track.get("url")
+            if not url:
+                raise HTTPException(status_code=400, detail="audio url 누락")
             start = float(track.get("startTime", 0))
-            fp    = fetch_and_resolve(url)
-            ac    = AudioFileClip(fp).set_start(start).volumex(vol)
-            audio_clips.append(ac)
+            fp = fetch_and_resolve(url)
+
+            aclip = AudioFileClip(fp).set_start(start).volumex(vol)
+            audio_clips.append(aclip)
 
     if not video_items and not audio_clips:
-        raise HTTPException(400, "합성할 트랙이 없습니다.")
+        raise HTTPException(status_code=400, detail="합성할 트랙이 없습니다.")
 
-    # ▶ priority 순 정렬 (작은 숫자 → 배경, 큰 숫자 → 전경)
+    # ----- 비디오/오디오 합성 -----
+    # priority 큰 것이 전경이 되도록 정렬
     video_items.sort(key=lambda x: -x[0])
-    ordered_clips = [clip for _, clip in video_items]
+    ordered_vclips = [c for _, c in video_items]
 
-    # ▶ 비디오 합성
-    final_video = CompositeVideoClip(
-        ordered_clips,
-        size=ordered_clips[0].size if ordered_clips else None
-    )
+    if ordered_vclips:
+        base_size = ordered_vclips[0].size
+    else:
+        # 비디오가 없다면 캔버스 크기로 빈 비디오 생성할 수도 있으나
+        # 여기선 오디오만 있는 경우를 단순히 오디오만 합성하도록 처리
+        base_size = (canvas_w, canvas_h)
 
-    # ▶ 오디오 합성
-    all_audio = [v.audio for v in ordered_clips if v.audio] + audio_clips
+    final_video = None
+    if ordered_vclips:
+        final_video = CompositeVideoClip(ordered_vclips, size=base_size)
+    else:
+        # 비디오가 하나도 없으면 단색 배경 영상 만들려면 아래 주석을 활용
+        # from moviepy.editor import ColorClip
+        # final_video = ColorClip(size=(canvas_w, canvas_h), color=(0,0,0), duration=max_dur)
+        raise HTTPException(status_code=400, detail="비디오 트랙이 최소 1개 필요합니다.")
+
+    # 오디오 합치기
+    all_audio = audio_clips  # 👈 배경음/생성된 음성 트랙들만 사용
     if all_audio:
         final_video.audio = CompositeAudioClip(all_audio)
+    else:
+        final_video = final_video.set_audio(None)
 
-    # ▶ 출력
+    # 1차 출력 (자막 전)
     out_path = os.path.join(tempdir, "merged_output.mp4")
     final_video.write_videofile(out_path, codec="libx264", audio_codec="aac")
 
-    # ▶ 리소스 해제
-    for _, c in video_items: c.close()
-    for a in audio_clips:        a.close()
+    # 리소스 해제
+    for _, c in video_items:
+        try:
+            c.close()
+        except Exception:
+            pass
+    for a in audio_clips:
+        try:
+            a.close()
+        except Exception:
+            pass
+
+    # ----- 자막 번인(옵션) -----
+    final_path = out_path
+    if subtitles:
+        ass_path = os.path.join(tempdir, "burn.ass")
+        write_ass(subtitles, ass_path, width=canvas_w, height=canvas_h)
+
+        burned_path = os.path.join(tempdir, "merged_with_subs.mp4")
+
+        # ✅ Windows용 경로 이스케이프 (ffmpeg subtitles 필터 규칙)
+        ass_arg = ass_path.replace("\\", "/")           # 백슬래시 → 슬래시
+        if len(ass_arg) >= 2 and ass_arg[1] == ":":     # 'C:/...' 형태면 드라이브 콜론 이스케이프
+            ass_arg = ass_arg[0] + "\\:" + ass_arg[2:]  # 'C\:/Users/...'
+
+        vf = f"subtitles=filename='{ass_arg}'"          # 공백 대비 작은따옴표 유지
+
+        run_cmd_no_stdout(
+            f'ffmpeg -y -i "{out_path}" -vf "{vf}" -c:a copy "{burned_path}"'
+        )
+        final_path = burned_path
 
     return FileResponse(
-        path=out_path,
-        filename="merged_output.mp4",
+        path=final_path,
+        filename=os.path.basename(final_path),
         media_type="video/mp4"
     )
-    
+
 @app.post("/translate-text")
 async def translate_text_endpoint(
     text: str = Form(...),
@@ -1056,36 +1537,42 @@ async def file_details(filename: str = Query(..., description="업로드된 비�
 
 @app.delete("/delete-video")
 async def delete_video(filename: str = Query(..., description="삭제할 영상 파일명")):
-    # DB에서 해당 영상 조회
     conn = get_connection()
     curs = conn.cursor()
     curs.execute(
-            "SELECT video_id, file_name, file_path, duration FROM videos WHERE file_name = %s ORDER BY video_id DESC LIMIT 1;",
-            (filename,)
-        )
+        "SELECT video_id, file_name, file_path, duration FROM videos WHERE file_name = %s ORDER BY video_id DESC LIMIT 1;",
+        (filename,)
+    )
     video = curs.fetchone()
     if not video:
         raise HTTPException(status_code=404, detail="해당 영상이 존재하지 않습니다.")
-    video_id, video_path = video
+    video_id, file_name, file_path, duration = video
     base_name = os.path.splitext(filename)[0]
 
-    # 파일 시스템에서 영상 파일 삭제
-    if os.path.exists(video_path):
-        os.remove(video_path)
+    # 썸네일 삭제
+    sprite = os.path.join("thumbnails", f"{video_id}.png")
+    cover  = os.path.join("thumbnails", f"{video_id}-cover.jpg")
+    for p in (sprite, cover):
+        if os.path.exists(p):
+            try: os.remove(p)
+            except: pass
+
+    # 영상 파일 삭제
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
     # 추출된 오디오 파일 삭제
     extracted_audio_path = os.path.join("extracted_audio", f"{base_name}.mp3")
     if os.path.exists(extracted_audio_path):
         os.remove(extracted_audio_path)
 
-    # Spleeter 결과 폴더 삭제 (예: extracted_audio/{base_name})
+    # Spleeter 폴더 삭제
     spleeter_folder = os.path.join("extracted_audio", base_name)
     if os.path.exists(spleeter_folder):
         shutil.rmtree(spleeter_folder)
 
-    # 관련 DB 레코드 삭제 (예: transcripts, translations, TTS, background_music, videos)
+    # DB 삭제
     try:
-        # TTS 삭제: transcripts와 연결된 translation, tts 기록 삭제
         curs.execute("""
             DELETE FROM tts 
             WHERE translation_id IN (
@@ -1105,7 +1592,7 @@ async def delete_video(filename: str = Query(..., description="삭제할 영상 
         curs.execute("DELETE FROM background_music WHERE video_id = %s;", (video_id,))
         curs.execute("DELETE FROM videos WHERE video_id = %s;", (video_id,))
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise HTTPException(status_code=500, detail="DB 삭제 중 오류 발생")
     finally:
@@ -1212,3 +1699,110 @@ async def get_video_and_subtitles(video_id: int, request: Request):
         if conn:
             conn.close()
         raise HTTPException(status_code=500, detail=f"DB 조회 실패: {e}")
+    
+def generate_waveform_png(audio_path: str, out_path: str, width_px: int, height_px: int = 100, bg="#FFFFFF", fg="#007bff", sr: int = 22050):
+    y, sr = librosa.load(audio_path, sr=sr, mono=True)
+    n = len(y) or sr // 2
+    if len(y) == 0:
+        import numpy as _np
+        y = _np.zeros(sr // 2)
+
+    samples_per_px = max(1, len(y) // width_px)
+    peaks = []
+    for i in range(width_px):
+        s = i * samples_per_px
+        e = min(len(y), s + samples_per_px)
+        amp = float(np.max(np.abs(y[s:e]))) if s < len(y) else 0.0
+        peaks.append(amp)
+    maxamp = max(peaks) or 1.0
+    peaks = [p / maxamp for p in peaks]
+
+    img = Image.new("RGB", (width_px, height_px), bg)
+    draw = ImageDraw.Draw(img)
+    mid = height_px / 2.0
+    for x, p in enumerate(peaks):
+        h = p * (height_px * 0.9)
+        y0 = int(mid - h/2); y1 = int(mid + h/2)
+        draw.line((x, y0, x, y1), fill=fg, width=1)
+    img.save(out_path, format="PNG")
+
+
+@app.post("/audio/upload")
+async def upload_audio_and_waveform(file: UploadFile = File(...)):
+    """
+    오디오 파일 저장 + 파형 PNG 생성
+    반환: { audio_url, waveform_url, duration, width_px }
+    """
+    try:
+        # 저장 위치: extracted_audio/sound_effects/*
+        ext = os.path.splitext(file.filename)[1].lower() or ".mp3"
+        audio_name = f"{uuid4().hex}{ext}"
+        audio_path = os.path.join(AUDIO_FOLDER, "sound_effects", audio_name)
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+
+        with open(audio_path, "wb") as f:
+            f.write(await file.read())
+
+        # 길이 → 타임라인 폭(px)
+        duration = float(librosa.get_duration(path=audio_path))
+        width_px = int(math.ceil(duration * 100))  # 규칙: 1초 = 100px
+
+        # 파형 PNG
+        wave_name = f"{os.path.splitext(audio_name)[0]}.png"
+        wave_path = os.path.join(WAVEFORM_FOLDER, wave_name)
+        generate_waveform_png(audio_path, wave_path, width_px=width_px, height_px=100)
+
+        return JSONResponse(
+            {
+                "audio_url": f"/extracted_audio/sound_effects/{audio_name}",
+                "waveform_url": f"/waveforms/{wave_name}",
+                "duration": duration,
+                "width_px": width_px
+            },
+            status_code=201
+        )
+    except Exception as e:
+        logging.exception(e)
+        raise HTTPException(status_code=500, detail=f"파형 생성 실패: {e}")
+
+
+@app.post("/audio/from-url")
+async def audio_from_url_and_waveform(src_url: str = Form(...)):
+    """
+    외부 오디오 URL 다운로드 + 파형 PNG 생성
+    반환: { audio_url, waveform_url, duration, width_px }
+    """
+    try:
+        r = requests.get(src_url, stream=True, timeout=30)
+        r.raise_for_status()
+
+        parsed_ext = os.path.splitext(src_url.split("?")[0])[1].lower()
+        ext = parsed_ext if parsed_ext in [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"] else ".mp3"
+
+        audio_name = f"{uuid4().hex}{ext}"
+        audio_path = os.path.join(AUDIO_FOLDER, "sound_effects", audio_name)
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+
+        with open(audio_path, "wb") as f:
+            shutil.copyfileobj(r.raw, f)
+
+        duration = float(librosa.get_duration(path=audio_path))
+        width_px = int(math.ceil(duration * 100))  # 1초 = 100px
+
+        wave_name = f"{os.path.splitext(audio_name)[0]}.png"
+        wave_path = os.path.join(WAVEFORM_FOLDER, wave_name)
+        generate_waveform_png(audio_path, wave_path, width_px=width_px, height_px=100)
+
+        return JSONResponse(
+            {
+                "audio_url": f"/extracted_audio/sound_effects/{audio_name}",
+                "waveform_url": f"/waveforms/{wave_name}",
+                "duration": duration,
+                "width_px": width_px
+            },
+            status_code=201
+        )
+    except Exception as e:
+        logging.exception(e)
+        raise HTTPException(status_code=500, detail=f"URL 파형 생성 실패: {e}")
+    

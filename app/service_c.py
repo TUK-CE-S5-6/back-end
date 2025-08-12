@@ -1,26 +1,49 @@
 import os
-import time
-import openai
 import logging
-from fastapi import FastAPI, Form, HTTPException
+import psycopg2
+import openai
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from elevenlabs.client import ElevenLabs
+from datetime import datetime
+from pydub import AudioSegment
 
-# 기본 URL 및 포트 설정 (필요에 따라 변경)
-BASE_HOST = "http://localhost"
-PORT = "8002"
+# ----------------------------
+# DB & API 설정
+# ----------------------------
+DB_NAME = "test"
+DB_USER = "postgres"
+DB_PASSWORD = "1234"
+DB_HOST = "localhost"
+DB_PORT = "5433"
 
+def get_connection():
+    return psycopg2.connect(
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT
+    )
+
+OPENAI_API_KEY = "gpt-key"
+openai.api_key = OPENAI_API_KEY
+
+ELEVENLABS_API_KEY = "eleven-key"
+elevenlabs = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+# ----------------------------
+# FastAPI 기본 설정
+# ----------------------------
 app = FastAPI()
-
 USER_FILES_FOLDER = "user_files"
+THUMBNAIL_FOLDER = "thumbnails"
 
-# 정적 파일 제공 (extracted_audio 폴더)
-app.mount("/extracted_audio", StaticFiles(directory="extracted_audio"), name="audio")
-app.mount("/user_files", StaticFiles(directory="extracted_audio"), name="audio")
+app.mount("/user_files", StaticFiles(directory=USER_FILES_FOLDER), name="user_files")
+app.mount("/thumbnails", StaticFiles(directory=THUMBNAIL_FOLDER), name="thumbnails")
 
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,91 +52,107 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 로깅 설정
 logging.basicConfig(level=logging.DEBUG)
-SOUND_EFFECTS_FOLDER_ROOT = "user_files"
 
-# OpenAI API 설정 (번역용)
-OPENAI_API_KEY = "gpt-key"
-openai.api_key = OPENAI_API_KEY
-
-# ElevenLabs API 키 및 클라이언트 초기화
-ELEVENLABS_API_KEY = "eleven-key"
-elevenlabs = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-# 사운드 이펙트 파일 저장 폴더
-SOUND_EFFECTS_FOLDER = os.path.join("extracted_audio", "sound_effects")
-os.makedirs(SOUND_EFFECTS_FOLDER, exist_ok=True)
-
+# ----------------------------
+# 번역 함수
+# ----------------------------
 def translate_text(text: str) -> str:
-    """
-    OpenAI GPT API를 사용해 텍스트를 영어로 번역하는 함수.
-    """
     try:
-        logging.info(f"번역 전 텍스트: {text}")
-        response = openai.ChatCompletion.create(
+        logging.info(f"번역 전: {text}")
+        resp = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "Translate the following text to english."},
+                {"role": "system", "content": "Translate the following text to English."},
                 {"role": "user", "content": text}
             ]
         )
-        translated_text = response["choices"][0]["message"]["content"].strip()
-        logging.info(f"번역 후 텍스트: {translated_text}")
-        return translated_text
+        translated = resp["choices"][0]["message"]["content"].strip()
+        logging.info(f"번역 후: {translated}")
+        return translated
     except Exception as e:
         logging.error(f"Translation failed: {e}")
-        raise Exception(f"Translation failed: {e}")
+        raise
 
-def generate_sound_effect(text: str, output_path: str):
-    logging.info("Generating sound effects...")
-    result = elevenlabs.text_to_sound_effects.convert(
-        text=text,
-        duration_seconds=10,      # 원하는 사운드 이펙트 길이 (초)
-        prompt_influence=0.3,      # 프롬프트 영향 (기본값 0.3)
-    )
-    with open(output_path, "wb") as f:
-        for chunk in result:
-            f.write(chunk)
-    logging.info(f"Audio saved to {output_path}")
-    return output_path
-
+# ----------------------------
+# 효과음 생성 API
+# ----------------------------
 @app.post("/generate-sound-effect")
 async def create_sound_effect(
     text: str = Form(...),
-    user_id: int = Form(...)
+    user_id: int = Form(...),          # ← 로그인 정보 직접 전달받음
+    preset_name: str = Form(None),
+    thumbnail_url: str = Form(None),
+    duration_seconds: int = Form(10),
+    prompt_influence: float = Form(0.3)
 ):
-    """
-    user_id와 text를 Form 데이터로 받아,
-    user_files/{user_id}/{파일명}으로 효과음을 생성 후 URL 반환
-    """
     try:
-        # 사용자별 폴더 생성
+        # 사용자 폴더 생성
         user_folder = os.path.join(USER_FILES_FOLDER, str(user_id))
         os.makedirs(user_folder, exist_ok=True)
 
         # 번역
         translated = translate_text(text)
 
-        # 파일명 및 경로
+        # 파일명 원문 그대로
         filename = f"{text}.mp3"
         output_path = os.path.join(user_folder, filename)
 
-        # 사운드 이펙트 생성
-        result = elevenlabs.text_to_sound_effects.convert(
-            text=translated
+        # ElevenLabs 효과음 생성
+        stream = elevenlabs.text_to_sound_effects.convert(
+            text=translated,
+            duration_seconds=duration_seconds,
+            prompt_influence=prompt_influence
         )
-        with open(output_path, 'wb') as f:
-            for chunk in result:
+        with open(output_path, "wb") as f:
+            for chunk in stream:
                 f.write(chunk)
 
-        # 결과 URL
+        # 오디오 길이
+        try:
+            seg = AudioSegment.from_file(output_path)
+            audio_duration = round(len(seg) / 1000.0, 3)
+        except:
+            audio_duration = float(duration_seconds)
+
+        # URL
         file_url = f"/user_files/{user_id}/{filename}"
+
+        # 프리셋 저장
+        preset_id = None
+        if preset_name:
+            try:
+                conn = get_connection()
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO sound_effects (user_id, name, description, file_path, thumbnail_url, duration)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                    """, (
+                        user_id,
+                        preset_name,
+                        text,  # description에 원문 저장
+                        file_url,
+                        thumbnail_url,
+                        audio_duration
+                    ))
+                    preset_id = cur.fetchone()[0]
+                    conn.commit()
+                conn.close()
+            except Exception as db_err:
+                logging.error(f"DB 저장 실패: {db_err}")
+
         return JSONResponse({
             "message": "Sound effect 생성 완료",
             "file_url": file_url,
             "original_text": text,
-            "translated_text": translated
+            "translated_text": translated,
+            "audio_duration": audio_duration,
+            "preset": {
+                "id": preset_id,
+                "name": preset_name,
+                "thumbnail_url": thumbnail_url
+            }
         })
 
     except Exception as e:

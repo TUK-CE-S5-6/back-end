@@ -12,6 +12,8 @@ voice_models/
 user_files/
 thumbnails/
 voice_stats/
+waveforms/
+images/
 
 # 기타 불필요한 파일
 __pycache__/
