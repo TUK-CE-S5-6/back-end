@@ -74,6 +74,7 @@ OPENAI_API_KEY = "gpt-key"
 openai.api_key = OPENAI_API_KEY
 
 
+
 # ── NEW: 언어별 평균 읽기 속도 (음절/문자 per sec)
 AVG_SYL_PER_SEC = {"ko": 6.2, "en": 6.19, "ja": 7.84, "zh": 5.18}
 TOL_RATIO = 0.02
@@ -135,6 +136,22 @@ def get_db_cursor():
     finally:
         curs.close()
         conn.close()
+
+def _qmark_for(lang: str) -> str:
+    """타깃 언어에 맞는 질문 부호 리턴."""
+    l2 = lang[:2]
+    return "？" if l2 in ("ja", "zh") else "?"
+
+def _force_question(text: str, qm: str) -> str:
+    """
+    결과가 질문문이 아니면 질문문으로 보정.
+    - 끝 문장부호(., !, ?, ？, 。, … 등) 제거 후 qm 부착
+    """
+    if not text:
+        return qm
+    t = text.rstrip().rstrip("。.!?？…」』”’ )]}")
+    return (t + qm).strip()
+
 
 # ----------------------------
 # 유틸리티 함수들
@@ -281,6 +298,7 @@ def translate_length_aware(
 ) -> str:
     """
     길이-의식 번역(텍스트 재작성 없이): 가장 근접한 번역문을 반환.
+    - 원문이 질문문이면 타깃 언어에서도 반드시 질문문으로 유지(+ 맞는 물음표)
     """
     tgt = tgt_lang[:2]
     cps = get_cps(db_cursor, voice_id, tgt)       # voice_lang_stats 없으면 fallback 사용
@@ -289,6 +307,10 @@ def translate_length_aware(
     lo, hi = target - tol, target + tol
     step   = max(1, int(round(target * step_ratio)))
     goal   = target
+
+    # 질문 여부/물음표
+    is_q_src = str(src_text).strip().endswith(("?", "？"))
+    qm = _qmark_for(tgt_lang)
 
     best_text = None
     best_dev  = 10**9
@@ -300,8 +322,11 @@ def translate_length_aware(
         sys_msg = (
             f"Translate from {src_lang[:2]} to {tgt}. "
             f"Make the output exactly {goal} units long. "
+            "Preserve sentence type (question vs statement vs exclamation) and punctuation. "
             "Keep proper nouns; do NOT summarize. "
             "Return ONLY the translation."
+            + (f" The source is a QUESTION; the output MUST remain a natural question and end with '{qm}'."
+               if is_q_src else "")
         )
         try:
             res = gpt_call_with_retry(
@@ -317,6 +342,10 @@ def translate_length_aware(
         if not res:
             continue
 
+        # 질문 보정
+        if is_q_src and not res.rstrip().endswith(qm):
+            res = _force_question(res, qm)
+
         d = _dev(res)
         if d < best_dev:
             best_dev, best_text = d, res
@@ -329,8 +358,11 @@ def translate_length_aware(
         goal += step if units < lo else -step
         goal = max(lo, min(hi, goal))
 
-    # 모든 시도에서 허용오차 실패 → 가장 근접한 후보 사용(없으면 원문)
-    return (best_text or src_text).strip()
+    # 모든 시도 실패 → 가장 근접한 후보 사용(없으면 원문)
+    final = (best_text or src_text).strip()
+    if is_q_src and not final.rstrip().endswith(qm):
+        final = _force_question(final, qm)
+    return final
 
 
 # ― Stretch (±3 % 이내)
@@ -610,13 +642,6 @@ def synth_to_file(
     with open(out_path, "wb") as f:
         f.write(resp.content)
 
-
-# ───────────────────────────────────────────────────────────
-#  /generate-tts-from-stt
-# ───────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────
-#  /generate-tts-from-stt
-# ───────────────────────────────────────────────────────────
 @app.post("/generate-tts-from-stt")
 async def generate_tts_from_stt(data: dict):
     video_id = data.get("video_id")
@@ -628,7 +653,7 @@ async def generate_tts_from_stt(data: dict):
         "B": "21m00Tcm4TlvDq8ikWAM",
         "C": "5Q0t7uMcjvnagumLfvZi",
     }
-    MAX_REWRITE_RETRY = 5
+    MAX_REWRITE_RETRY = 8
     tts_dir = os.path.join(AUDIO_FOLDER, f"{video_id}_tts")
     ensure_folder(tts_dir)
 
@@ -660,6 +685,8 @@ async def generate_tts_from_stt(data: dict):
                     continue
 
                 TOL = get_tol(tgt_l)
+                qm  = _qmark_for(tgt_l)
+                is_q_src = str(src).strip().endswith(("?", "？"))
 
                 # ① 길이-의식 번역(시드)
                 text = translate_length_aware(
@@ -670,6 +697,9 @@ async def generate_tts_from_stt(data: dict):
                     voice_id=voice,
                     db_cursor=cur,
                 )
+                # 안전망: 질문 보정
+                if is_q_src and not text.rstrip().endswith(qm):
+                    text = _force_question(text, qm)
 
                 # ② 합성/검증 루프 + "가장 근접" 후보 기억
                 best_delta = float("inf")
@@ -704,7 +734,12 @@ async def generate_tts_from_stt(data: dict):
                         else 'han characters' if tgt_l == 'zh'
                         else 'chars'
                     )
-                    sys_msg = f"Rewrite to {need_len} {unit_nm}. Keep proper nouns; do NOT summarize."
+                    sys_msg = (
+                        f"Rewrite to {need_len} {unit_nm}. "
+                        "Preserve sentence type and punctuation; keep proper nouns; do NOT summarize."
+                        + (f" It MUST remain a natural question and end with '{qm}'."
+                           if is_q_src else "")
+                    )
                     try:
                         text = gpt_call_with_retry(
                             model="gpt-4o",
@@ -714,10 +749,13 @@ async def generate_tts_from_stt(data: dict):
                             ],
                             request_timeout=15,
                         ).choices[0].message.content.strip()
+                        # 재작성 후 질문 보정
+                        if is_q_src and not text.rstrip().endswith(qm):
+                            text = _force_question(text, qm)
                     except Exception as e:
                         logging.warning(f"[rewrite] GPT 실패(계속 진행): {e}")
 
-                # ③ 8회 모두 실패 → '가장 근접' 텍스트로 speed/SSML/타임스트레치 순 폴백
+                # ③ 5회 모두 실패 → '가장 근접' 텍스트로 speed/SSML/타임스트레치 순 폴백
                 if chosen_path is None:
                     if not best_mp3:
                         raise RuntimeError("합성에 실패하여 후보가 없습니다.")
@@ -726,17 +764,21 @@ async def generate_tts_from_stt(data: dict):
                     chosen_dur  = best_dur
                     chosen_path = best_mp3
 
+                    # 안전망: 질문 보정
+                    if is_q_src and chosen_text and not chosen_text.rstrip().endswith(qm):
+                        chosen_text = _force_question(chosen_text, qm)
+
                     try:
                         if best_dur and dur > 0:
                             needed = dur / best_dur  # 필요한 속도 배율
                             if 0.7 <= needed <= 1.2:
                                 speed_path = os.path.join(tts_dir, f"best_{tid}_spd.mp3")
-                                synth_to_file(voice, best_text, speed_path, speed=needed)
+                                synth_to_file(voice, chosen_text, speed_path, speed=needed)
                                 real_spd = librosa.get_duration(path=speed_path) or best_dur
                                 chosen_path, chosen_dur = speed_path, real_spd
                             else:
                                 rate_pct = int((dur / (best_dur or dur or 1.0)) * 100)
-                                ssml = f'<speak><prosody rate="{rate_pct}%">{best_text}</prosody></speak>'
+                                ssml = f'<speak><prosody rate="{rate_pct}%">{chosen_text}</prosody></speak>'
                                 ssml_path = os.path.join(tts_dir, f"best_{tid}_ssml.mp3")
                                 synth_to_file(voice, ssml, ssml_path)
                                 chosen_path = ssml_path
@@ -750,6 +792,10 @@ async def generate_tts_from_stt(data: dict):
                             logging.warning(f"[adjust-fallback] 실패(그냥 진행): {e2}")
 
                 final_mp3, final_dur, final_text = chosen_path, chosen_dur, chosen_text
+
+                # 최종 안전망: 질문 보정
+                if is_q_src and final_text and not final_text.rstrip().endswith(qm):
+                    final_text = _force_question(final_text, qm)
 
                 # ④ translations UPSERT (저장 텍스트 = chosen/best 텍스트)
                 cur.execute(
@@ -805,10 +851,6 @@ async def generate_tts_from_stt(data: dict):
         )
     return {"message": "TTS 완료", "generated": generated_cnt}
 
-
-# ───────────────────────────────────────────────────────────
-#  /edit-tts
-# ───────────────────────────────────────────────────────────
 @app.post("/edit-tts")
 async def edit_tts(
     tts_id: int = Form(...),
@@ -816,7 +858,7 @@ async def edit_tts(
     text: str = Form(...),
     update_src: bool = Form(True),
 ):
-    MAX_RETRY = 5
+    MAX_RETRY = 2
 
     with get_db_cursor() as cur:
         cur.execute(
@@ -846,8 +888,10 @@ async def edit_tts(
         ensure_folder(base_dir)
 
         TOL = get_tol(tgt_l)
+        qm  = _qmark_for(tgt_l)
+        is_q_src = str(text).strip().endswith(("?", "？"))  # 편집 입력이 질문문이면 유지
 
-        # 길이-의식 번역(시드)
+        # 길이-의식 번역(시드) + 질문 보정
         new_text = translate_length_aware(
             src_text=text,
             src_lang=src_l,
@@ -856,6 +900,8 @@ async def edit_tts(
             voice_id=voice,
             db_cursor=cur,
         )
+        if is_q_src and not new_text.rstrip().endswith(qm):
+            new_text = _force_question(new_text, qm)
 
         best_delta = float("inf")
         best_mp3   = None
@@ -888,7 +934,11 @@ async def edit_tts(
                 else 'han characters' if tgt_l == 'zh'
                 else 'chars'
             )
-            sys_msg = f"Rewrite to {need_len} {unit_nm}. Keep names."
+            sys_msg = (
+                f"Rewrite to {need_len} {unit_nm}. "
+                "Preserve sentence type and punctuation; keep names."
+                + (f" It MUST remain a natural question and end with '{qm}'." if is_q_src else "")
+            )
             try:
                 new_text = gpt_call_with_retry(
                     model="gpt-4o",
@@ -898,6 +948,8 @@ async def edit_tts(
                     ],
                     request_timeout=15,
                 ).choices[0].message.content.strip()
+                if is_q_src and not new_text.rstrip().endswith(qm):
+                    new_text = _force_question(new_text, qm)
             except Exception as e:
                 logging.warning(f"[edit-tts/rewrite] GPT 실패(계속): {e}")
 
@@ -910,17 +962,21 @@ async def edit_tts(
             final_dur  = best_dur
             final_path = best_mp3
 
+            # 안전망: 질문 보정
+            if is_q_src and final_text and not final_text.rstrip().endswith(qm):
+                final_text = _force_question(final_text, qm)
+
             try:
                 if best_dur and target_dur > 0:
                     needed = target_dur / best_dur
                     if 0.7 <= needed <= 1.2:
                         speed_file = os.path.join(base_dir, f"edit_{tts_id}_best_spd.mp3")
-                        synth_to_file(voice, best_text, speed_file, speed=needed)
+                        synth_to_file(voice, final_text, speed_file, speed=needed)
                         real_spd = librosa.get_duration(path=speed_file) or best_dur
                         final_path, final_dur = speed_file, real_spd
                     else:
                         rate_pct = int((target_dur / (best_dur or target_dur or 1.0)) * 100)
-                        ssml = f'<speak><prosody rate="{rate_pct}%">{best_text}</prosody></speak>'
+                        ssml = f'<speak><prosody rate="{rate_pct}%">{final_text}</prosody></speak>'
                         ssml_file = os.path.join(base_dir, f"edit_{tts_id}_best_ssml.mp3")
                         synth_to_file(voice, ssml, ssml_file)
                         final_path = ssml_file
@@ -1250,6 +1306,7 @@ async def list_voice_models():
             "image_url":   img,       # ← NEW: 포함
         })
     return JSONResponse(content=models)
+
 
 def generate_waveform_png(audio_path: str, out_path: str, width_px: int, height_px: int = 100):
     y, sr = librosa.load(audio_path, sr=22050, mono=True)

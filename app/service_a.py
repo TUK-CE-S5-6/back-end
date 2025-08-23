@@ -788,7 +788,7 @@ def call_assemblyai_with_diarization(audio_path: str) -> dict:
 
 
 ############################################
-# STT 변환 함수 (영어→AssemblyAI, 기타→Clova)
+# STT 변환 함수 (모든 언어 → Clova + diarization)
 ############################################
 async def transcribe_audio(
     audio_path: str,
@@ -798,66 +798,52 @@ async def transcribe_audio(
     speaker_max: int | None = None,
 ):
     """
-    영어(en*)는 AssemblyAI(+speaker_labels),
-    그 외(ko/ja/zh 등)는 Clova + diarization(기본 1~3명) 사용.
-    speaker_min/max 인자를 주면 그 값으로 오버라이드.
+    모든 언어(ko/en/ja/zh …)를 Clova Speech Long Sentence API로 처리합니다.
+    - diarization 기본값은 DIARIZATION_DEFAULTS의 언어별 min/max(기본 1~3명)를 사용
+    - speaker_min/max를 인자로 넘기면 해당 값이 우선됩니다.
     """
     start_time = time.time()
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
+    # 언어별 화자수 기본 적용 or 오버라이드
+    if speaker_min is None or speaker_max is None:
+        key = _norm_lang_key(source_language)
+        dflt = DIARIZATION_DEFAULTS.get(key, {"min": 1, "max": 3})
+        speaker_min = dflt["min"] if speaker_min is None else speaker_min
+        speaker_max = dflt["max"] if speaker_max is None else speaker_max
+
+    # (선택) STT 안정화 전처리해서 넣고 싶다면 아래 두 줄로 교체:
+    # prepped = preprocess_audio_for_stt(audio_path)
+    # stt_src = prepped
+    stt_src = audio_path
+
     conn = get_connection()
     curs = conn.cursor()
 
     try:
-        # ---- 영어 : AssemblyAI ----
-        if source_language.lower().startswith("en"):
-            result = call_assemblyai_with_diarization(audio_path)
-            for utt in result.get("utterances", []):
-                s   = float(utt["start"]) / 1000.0
-                e   = float(utt["end"])   / 1000.0
-                txt = utt.get("text", "")
-                spk = utt.get("speaker", "")
-                curs.execute(
-                    """
-                    INSERT INTO transcripts
-                      (video_id, language, text, start_time, end_time, speaker)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (video_id, source_language, txt, s, e, spk),
-                )
+        result = clova_speech_stt(
+            stt_src,
+            language=source_language,
+            speakerCountMin=speaker_min,
+            speakerCountMax=speaker_max,
+        )
 
-        # ---- 그 외 언어 : Clova ----
-        else:
-            # 언어별 기본값(1~3) 적용 또는 인자 오버라이드
-            if speaker_min is None or speaker_max is None:
-                key = _norm_lang_key(source_language)
-                dflt = DIARIZATION_DEFAULTS.get(key, {"min": 1, "max": 3})
-                speaker_min = dflt["min"] if speaker_min is None else speaker_min
-                speaker_max = dflt["max"] if speaker_max is None else speaker_max
-
-            result = clova_speech_stt(
-                audio_path,
-                language=source_language,
-                speakerCountMin=speaker_min,
-                speakerCountMax=speaker_max,
+        # Clova 응답 파싱
+        for seg in result.get("segments", []):
+            s = float(seg.get("start", 0)) / 1000.0
+            e = float(seg.get("end",   0)) / 1000.0
+            txt = seg.get("text", "")
+            spk_info = seg.get("speaker", {}) or {}
+            spk = spk_info.get("name") or spk_info.get("label") or ""
+            curs.execute(
+                """
+                INSERT INTO transcripts
+                  (video_id, language, text, start_time, end_time, speaker)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (video_id, source_language, txt, s, e, spk),
             )
-
-            # Clova 응답 파싱
-            for seg in result.get("segments", []):
-                s = float(seg.get("start", 0)) / 1000.0
-                e = float(seg.get("end",   0)) / 1000.0
-                txt = seg.get("text", "")
-                spk_info = seg.get("speaker", {}) or {}
-                spk = spk_info.get("name") or spk_info.get("label") or ""
-                curs.execute(
-                    """
-                    INSERT INTO transcripts
-                      (video_id, language, text, start_time, end_time, speaker)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (video_id, source_language, txt, s, e, spk),
-                )
 
         conn.commit()
         return {"stt_time": time.time() - start_time}
@@ -1168,7 +1154,33 @@ def _sec_to_ass_time(t: float) -> str:
     s = t % 60
     return f"{h:d}:{m:02d}:{s:05.2f}"
 
-def write_ass(subs: list, ass_path: str, width: int = 1280, height: int = 720):
+def write_ass(subs: list, ass_path: str, width: int = 1280, height: int = 720, style: dict | None = None):
+    """
+    subs: [{text,start,end,color}]
+    style: {
+      "fontName": "Pretendard",
+      "fontScale": 0.056,  # 기본값(2배). 화면 짧은 변 × 비율 → pt 환산
+      "fontSize": 64,      # 명시하면 fontScale 무시
+      "outline": 3,
+      "shadow": 0,
+      "alignment": 2,      # 2=하단 중앙
+      "marginV": 28
+    }
+    """
+    style = style or {}
+
+    # --- 폰트 크기 계산(기본 2배) ---
+    short_side = min(width, height)
+    font_scale = float(style.get("fontScale", 0.056))  # ← 2배 기본
+    font_size  = int(round(style.get("fontSize", short_side * font_scale))) \
+                 if "fontSize" in style else int(round(short_side * font_scale))
+
+    font_name = style.get("fontName", "Pretendard")
+    outline   = int(style.get("outline", 3))
+    shadow    = int(style.get("shadow", 0))
+    align     = int(style.get("alignment", 2))
+    margin_v  = int(style.get("marginV", 28))
+
     def _esc(s: str) -> str:
         return (s or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
@@ -1190,9 +1202,8 @@ PlayResX: {width}
 PlayResY: {height}
 
 [V4+ Styles]
-; Fontsize=28 → 클라이언트 캔버스 폰트와 동일
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Pretendard,28,&H00FFFFFF,&H000000FF,&HDD000000,&H99000000,0,0,0,0,100,100,0,0,3,4,0,2,60,60,28,0
+Style: Default,{font_name},{font_size},&H00FFFFFF,&H000000FF,&HDD000000,&H99000000,0,0,0,0,100,100,0,0,3,{outline},{shadow},{align},60,60,{margin_v},0
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1208,7 +1219,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             end = start + 1.0
 
         cue_color = _ff_to_ass_bgr(item.get("color", "#FFFFFF"))
-        # 좌우 컬러 바 표시
         ass_text = f"{{\\c{cue_color}}}▌{{\\c&H00FFFFFF&}} {text} {{\\c{cue_color}}}▌"
 
         lines.append(
@@ -1221,39 +1231,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 @app.post("/merge-media")
 async def merge_media(request: Request):
     """
-    요청 예시(payload):
+    payload 예시
     {
-      "videoTracks": [
-        {
-          "name": "Video Track 1",
-          "volume": 80,
-          "tracks": [
-            { "url": "...mp4", "startTime": 0.0, "duration": 5.2 }
-          ]
-        }
-      ],
-      "audioTracks": [
-        {
-          "volume": 100,
-          "tracks": [
-            { "url": "...mp3", "startTime": 0.0, "duration": 3.0 }
-          ]
-        }
-      ],
-      "canvas": { "width": 1280, "height": 720 },
-      "subtitles": [
-        { "text": "Hello", "start": 1.2, "end": 3.5, "color": "#FFFFFF" }
-      ]
+      "videoTracks": [...],
+      "audioTracks": [...],
+      "subtitles": [...],
+      "subtitlesStyle": {"fontScale": 0.024, "outline": 3, "marginV": 36},
+      "upscale": 2.0,                           // ← 배율(옵션)
+      "targetResolution": {"width": 2560, "height": 1440} // ← 우선순위 더 높음(옵션)
     }
     """
     payload = await request.json()
     tempdir = tempfile.mkdtemp(prefix="merge_")
 
-    # ----- 캔버스/자막(옵션) -----
-    canvas = payload.get("canvas") or {}
-    canvas_w = int(canvas.get("width", 1280))
-    canvas_h = int(canvas.get("height", 720))
-    subtitles = payload.get("subtitles", []) or []
+    subtitles   = payload.get("subtitles", []) or []
+    subs_style  = payload.get("subtitlesStyle", {}) or {}
+    upscale     = float(payload.get("upscale", 1.0))
+    tgt_res_in  = payload.get("targetResolution") or {}
 
     video_items = []  # (priority, clip)
     audio_clips = []
@@ -1265,14 +1259,11 @@ async def merge_media(request: Request):
 
         if isinstance(path_or_url, str) and not path_or_url.startswith("http"):
             path_or_url = unquote(path_or_url)
-            exists = os.path.isfile(path_or_url)
-            logging.info(f"[merge] isfile={exists}")
-            if not exists:
+            if not os.path.isfile(path_or_url):
                 raise HTTPException(404, f"파일을 찾을 수 없습니다: {raw_url} -> {path_or_url}")
             return path_or_url
 
-        # 원격(URL)인 경우에만 다운로드
-        r = requests.get(path_or_url, stream=True, timeout=300)  # 타임아웃 여유
+        r = requests.get(path_or_url, stream=True, timeout=300)
         r.raise_for_status()
         ext = os.path.splitext(urlparse(path_or_url).path)[1] or ".bin"
         fn = os.path.join(tempdir, f"dl_{time.time():.0f}{ext}")
@@ -1280,28 +1271,22 @@ async def merge_media(request: Request):
             shutil.copyfileobj(r.raw, f)
         return fn
 
-
-    # ----- 비디오 트랙 구성 -----
+    # ----- 비디오 트랙 -----
     for group in payload.get("videoTracks", []) or []:
-        name = group.get("name", "")
         try:
-            # "Video Track 1" → 1 (숫자 없으면 0)
-            priority = int(name.strip().split()[-1])
+            priority = int(group.get("name", "").strip().split()[-1])
         except Exception:
             priority = 0
-        vol = float(group.get("volume", 100)) / 100.0
-
         for track in group.get("tracks", []) or []:
             url = track.get("url")
             if not url:
                 raise HTTPException(status_code=400, detail="video url 누락")
             start = float(track.get("startTime", 0))
             fp = fetch_and_resolve(url)
-
             vclip = VideoFileClip(fp).set_start(start).without_audio()
             video_items.append((priority, vclip))
 
-    # ----- 오디오 트랙 구성 -----
+    # ----- 오디오 트랙 -----
     for group in payload.get("audioTracks", []) or []:
         vol = float(group.get("volume", 100)) / 100.0
         for track in group.get("tracks", []) or []:
@@ -1310,76 +1295,118 @@ async def merge_media(request: Request):
                 raise HTTPException(status_code=400, detail="audio url 누락")
             start = float(track.get("startTime", 0))
             fp = fetch_and_resolve(url)
-
             aclip = AudioFileClip(fp).set_start(start).volumex(vol)
             audio_clips.append(aclip)
 
     if not video_items and not audio_clips:
         raise HTTPException(status_code=400, detail="합성할 트랙이 없습니다.")
 
-    # ----- 비디오/오디오 합성 -----
-    # priority 큰 것이 전경이 되도록 정렬
+    # 전경 우선
     video_items.sort(key=lambda x: -x[0])
     ordered_vclips = [c for _, c in video_items]
-
-    if ordered_vclips:
-        base_size = ordered_vclips[0].size
-    else:
-        # 비디오가 없다면 캔버스 크기로 빈 비디오 생성할 수도 있으나
-        # 여기선 오디오만 있는 경우를 단순히 오디오만 합성하도록 처리
-        base_size = (canvas_w, canvas_h)
-
-    final_video = None
-    if ordered_vclips:
-        final_video = CompositeVideoClip(ordered_vclips, size=base_size)
-    else:
-        # 비디오가 하나도 없으면 단색 배경 영상 만들려면 아래 주석을 활용
-        # from moviepy.editor import ColorClip
-        # final_video = ColorClip(size=(canvas_w, canvas_h), color=(0,0,0), duration=max_dur)
+    if not ordered_vclips:
         raise HTTPException(status_code=400, detail="비디오 트랙이 최소 1개 필요합니다.")
 
-    # 오디오 합치기
-    all_audio = audio_clips  # 👈 배경음/생성된 음성 트랙들만 사용
-    if all_audio:
-        final_video.audio = CompositeAudioClip(all_audio)
+    base_w, base_h = ordered_vclips[0].size
+    try:
+        target_fps = int(round(ordered_vclips[0].fps)) if getattr(ordered_vclips[0], "fps", None) else None
+    except Exception:
+        target_fps = None
+
+    final_video = CompositeVideoClip(ordered_vclips, size=(base_w, base_h))
+    if audio_clips:
+        final_video.audio = CompositeAudioClip(audio_clips)
     else:
         final_video = final_video.set_audio(None)
 
-    # 1차 출력 (자막 전)
-    out_path = os.path.join(tempdir, "merged_output.mp4")
-    final_video.write_videofile(out_path, codec="libx264", audio_codec="aac")
+    # 1차 출력(메자닌) — 고품질 인코딩
+    mezz_path = os.path.join(tempdir, "mezzanine.mp4")
+    write_kwargs = {
+        "codec": "libx264",
+        "audio_codec": "aac",
+        "audio_bitrate": "192k",
+        "preset": "slow",
+        "ffmpeg_params": [
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-profile:v", "high",
+            "-level", "4.1"
+        ]
+    }
+    if target_fps:
+        write_kwargs["fps"] = target_fps
+    final_video.write_videofile(mezz_path, **write_kwargs)
 
     # 리소스 해제
     for _, c in video_items:
-        try:
-            c.close()
-        except Exception:
-            pass
+        try: c.close()
+        except: pass
     for a in audio_clips:
-        try:
-            a.close()
-        except Exception:
-            pass
+        try: a.close()
+        except: pass
 
-    # ----- 자막 번인(옵션) -----
-    final_path = out_path
+    # 최종 해상도 결정: targetResolution > upscale > 원본
+    if isinstance(tgt_res_in, dict) and tgt_res_in.get("width") and tgt_res_in.get("height"):
+        final_w = int(tgt_res_in["width"])
+        final_h = int(tgt_res_in["height"])
+    else:
+        # upscale 배율 적용 (짝수 보장: H.264 요건)
+        final_w = int(round(base_w * max(1.0, upscale)) // 2 * 2)
+        final_h = int(round(base_h * max(1.0, upscale)) // 2 * 2)
+
+    need_scale = (final_w != base_w) or (final_h != base_h)
+
+    # 자막: 최종 해상도 기준으로 작성 (폰트 비례)
+    final_path = mezz_path
     if subtitles:
         ass_path = os.path.join(tempdir, "burn.ass")
-        write_ass(subtitles, ass_path, width=canvas_w, height=canvas_h)
+        write_ass(subtitles, ass_path, width=final_w, height=final_h, style=subs_style)
 
-        burned_path = os.path.join(tempdir, "merged_with_subs.mp4")
+        burned_path = os.path.join(tempdir, "merged_final.mp4")
+        ass_arg = ass_path.replace("\\", "/")
+        if len(ass_arg) >= 2 and ass_arg[1] == ":":
+            ass_arg = ass_arg[0] + "\\:" + ass_arg[2:]
 
-        # ✅ Windows용 경로 이스케이프 (ffmpeg subtitles 필터 규칙)
-        ass_arg = ass_path.replace("\\", "/")           # 백슬래시 → 슬래시
-        if len(ass_arg) >= 2 and ass_arg[1] == ":":     # 'C:/...' 형태면 드라이브 콜론 이스케이프
-            ass_arg = ass_arg[0] + "\\:" + ass_arg[2:]  # 'C\:/Users/...'
+        # 스케일 → 자막 번인 순서로 필터 체인 구성
+        vf_chain = []
+        if need_scale:
+            vf_chain.append(f"scale={final_w}:{final_h}:flags=lanczos")
+            # (선택) 가장자리 선명도 약간 보정
+            # vf_chain.append("unsharp=3:3:0.3:3:3:0.3")
+        vf_chain.append(f"subtitles=filename='{ass_arg}'")
+        vf = ",".join(vf_chain)
 
-        vf = f"subtitles=filename='{ass_arg}'"          # 공백 대비 작은따옴표 유지
-
-        run_cmd_no_stdout(
-            f'ffmpeg -y -i "{out_path}" -vf "{vf}" -c:a copy "{burned_path}"'
+        # 업스케일은 화질 손실이 크게 느껴지므로 CRF를 더 낮춰(=고화질) 인코딩 권장
+        ffmpeg_cmd = (
+            f'ffmpeg -y -i "{mezz_path}" -vf "{vf}" '
+            f'-c:v libx264 -preset slow -crf 16 -pix_fmt yuv420p '
+            f'-profile:v high -level 4.1 -movflags +faststart '
+            f'-c:a aac -b:a 192k '
         )
+        if target_fps:
+            ffmpeg_cmd += f'-r {target_fps} '
+        ffmpeg_cmd += f'"{burned_path}"'
+
+        run_cmd_no_stdout(ffmpeg_cmd)
         final_path = burned_path
+
+    else:
+        # 자막이 없으면 스케일만 적용 (필요 시)
+        if need_scale:
+            scaled_path = os.path.join(tempdir, "merged_final.mp4")
+            vf = f"scale={final_w}:{final_h}:flags=lanczos"
+            ffmpeg_cmd = (
+                f'ffmpeg -y -i "{mezz_path}" -vf "{vf}" '
+                f'-c:v libx264 -preset slow -crf 16 -pix_fmt yuv420p '
+                f'-profile:v high -level 4.1 -movflags +faststart '
+                f'-c:a aac -b:a 192k '
+            )
+            if target_fps:
+                ffmpeg_cmd += f'-r {target_fps} '
+            ffmpeg_cmd += f'"{scaled_path}"'
+            run_cmd_no_stdout(ffmpeg_cmd)
+            final_path = scaled_path
 
     return FileResponse(
         path=final_path,
